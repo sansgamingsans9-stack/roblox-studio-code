@@ -21,6 +21,14 @@ local SUMMON_COOLDOWN = 0        -- seconds between summons per player (anti-spa
 local ALLOW_DIRECT_BUY = false   -- false = towers can ONLY be summoned (blocks the old "Buy" exploit)
 
 ----------------------------------------------------------------
+-- MINING SETTINGS (Stars for every rock hit that does damage)
+----------------------------------------------------------------
+local MINE_REWARD_MIN = 0          -- fewest Stars one hit can give
+local MINE_REWARD_MAX = 100        -- most Stars one hit can give
+local MINE_REWARD_COOLDOWN = 0.3   -- seconds between rewarded hits per player (keep it a bit under your real swing time)
+local MINE_REWARD_RANGE = 15       -- how close (studs) you must be to the rock's edge
+
+----------------------------------------------------------------
 -- UNIT SETTINGS
 ----------------------------------------------------------------
 local ALLOW_DUPLICATE_EQUIP = true   -- true = you can equip multiple copies of the same tower
@@ -70,6 +78,8 @@ if SUMMON_PRICE < 0 then
 	warn("[Summon] SUMMON_PRICE was negative, which would GIVE Stars. Using " .. -SUMMON_PRICE .. " instead.")
 	SUMMON_PRICE = -SUMMON_PRICE
 end
+MINE_REWARD_MIN = math.max(0, math.floor(MINE_REWARD_MIN))
+MINE_REWARD_MAX = math.max(MINE_REWARD_MIN, math.floor(MINE_REWARD_MAX))
 
 -- Clients read these, so there's only one place to change them
 ReplicatedStorage:SetAttribute("SummonPrice", SUMMON_PRICE)
@@ -1034,6 +1044,67 @@ summonRemote.OnServerInvoke = function(player)
 end
 
 ----------------------------------------------------------------
+-- MINING REWARDS (settings at the top: MINE_REWARD_...)
+----------------------------------------------------------------
+--[[
+	MineRewardController (client) fires MineReward with the rock it just hit.
+	The server checks the hit could really have happened (your character is
+	alive and next to that rock, and you aren't hitting faster than
+	MINE_REWARD_COOLDOWN), rolls MINE_REWARD_MIN..MINE_REWARD_MAX Stars and adds
+	them. Then it tells the client how many it got, so the client can show the
+	star drop flying into you (nothing shows for a 0 roll).
+]]
+local mineRewardRemote = ReplicatedStorage:FindFirstChild("MineReward")
+if not mineRewardRemote then
+	mineRewardRemote = Instance.new("RemoteEvent")
+	mineRewardRemote.Name = "MineReward"
+	mineRewardRemote.Parent = ReplicatedStorage
+end
+
+local mineRng = Random.new()
+local lastMineReward = {}
+
+-- studs from a point to the outside of a model's bounding box (0 when inside it)
+local function distanceToModel(position, model)
+	local boxCFrame, boxSize = model:GetBoundingBox()
+	local half = boxSize / 2
+	local point = boxCFrame:PointToObjectSpace(position)
+	local clamped = Vector3.new(
+		math.clamp(point.X, -half.X, half.X),
+		math.clamp(point.Y, -half.Y, half.Y),
+		math.clamp(point.Z, -half.Z, half.Z)
+	)
+	return (point - clamped).Magnitude, boxCFrame.Position
+end
+
+mineRewardRemote.OnServerEvent:Connect(function(player, rock)
+	local playerData = data[player.UserId]
+	if not playerData then return end
+	if typeof(rock) ~= "Instance" or not rock:IsA("Model") or not rock:IsDescendantOf(workspace) then return end
+	if Players:GetPlayerFromCharacter(rock) or not rock:FindFirstChildWhichIsA("BasePart", true) then return end
+
+	local character = player.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	if not humanoid or humanoid.Health <= 0 or not root then return end
+
+	local now = os.clock()
+	if lastMineReward[player] and now - lastMineReward[player] < MINE_REWARD_COOLDOWN then return end
+	local distance, center = distanceToModel(root.Position, rock)
+	if distance > MINE_REWARD_RANGE then return end
+	lastMineReward[player] = now
+
+	local amount = mineRng:NextInteger(MINE_REWARD_MIN, MINE_REWARD_MAX)
+	if amount > 0 then
+		playerData.Stars = (tonumber(playerData.Stars) or 0) + amount
+		playerData.JustReset = nil -- real progress, so a future !resetdata backs this up
+		dirty[player.UserId] = true -- saved on the next autosave
+		player:SetAttribute("Stars", playerData.Stars) -- MainGui currency
+	end
+	mineRewardRemote:FireClient(player, amount, rock, center)
+end)
+
+----------------------------------------------------------------
 -- CODES (the list is in the settings at the top: CODES)
 ----------------------------------------------------------------
 local redeemRemote = ReplicatedStorage:FindFirstChild("RedeemCode")
@@ -1876,6 +1947,7 @@ Players.PlayerAdded:Connect(onPlayerAdded)
 
 Players.PlayerRemoving:Connect(function(player)
 	lastSummon[player] = nil
+	lastMineReward[player] = nil
 	started[player] = nil
 end)
 

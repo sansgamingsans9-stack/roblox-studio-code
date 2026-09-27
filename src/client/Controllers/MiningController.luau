@@ -33,6 +33,7 @@ const Sounds = require("../Shared/Sounds")
 const ObserveRocks = require("../Observers/ObserveRocks")
 const ObservePickaxe = require("../Observers/ObservePickaxe")
 const InputController = require("./InputController")
+const MineRewardController = require("./MineRewardController")
 const RockEffectsController = require("./RockEffectsController")
 
 const Domain = script:GetAttribute("Website")
@@ -130,6 +131,7 @@ const function Hit(Root: BasePart, Swing: MiningRules.Swing)
 
 	RockEffectsController.PlayHit(Rock, Root.Position, true, false, Swing, Root)
 	Network.MineHit:Fire(Rock)
+	MineRewardController.OnHit(Rock) -- screen shake + random Stars drop
 end
 
 const function IsSwinging(): boolean
@@ -205,6 +207,8 @@ end
 -- watermarks untouched.⁠‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌‌⁠
 
 const function Start()
+	MineRewardController.Start()
+
 	const First = Assets.FindAnimation("Mine 1")
 	const Second = Assets.FindAnimation("Mine 2")
 
