@@ -12,8 +12,8 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 mkdir -p "$WORK/mods"
-GLOBALS="game, Enum, Vector3, Vector2, CFrame, Color3, ColorSequence, NumberSequence, NumberSequenceKeypoint, NumberRange, Instance, RaycastParams, OverlapParams, Content, task, warn, shared, os"
-INJECT="local __rbx = require(\"../rbxmock\"); local $GLOBALS = __rbx.game, __rbx.Enum, __rbx.Vector3, __rbx.Vector2, __rbx.CFrame, __rbx.Color3, __rbx.ColorSequence, __rbx.NumberSequence, __rbx.NumberSequenceKeypoint, __rbx.NumberRange, __rbx.Instance, __rbx.RaycastParams, __rbx.OverlapParams, __rbx.Content, __rbx.task, __rbx.warn, __rbx.shared, __rbx.os"
+GLOBALS="game, Enum, Vector3, Vector2, CFrame, Color3, ColorSequence, NumberSequence, NumberSequenceKeypoint, NumberRange, Instance, RaycastParams, OverlapParams, Content, task, warn, shared, os, UserSettings"
+INJECT="local __rbx = require(\"../rbxmock\"); local $GLOBALS = __rbx.game, __rbx.Enum, __rbx.Vector3, __rbx.Vector2, __rbx.CFrame, __rbx.Color3, __rbx.ColorSequence, __rbx.NumberSequence, __rbx.NumberSequenceKeypoint, __rbx.NumberRange, __rbx.Instance, __rbx.RaycastParams, __rbx.OverlapParams, __rbx.Content, __rbx.task, __rbx.warn, __rbx.shared, __rbx.os, __rbx.UserSettings"
 for f in "$ROOT"/src/DeformableSnow/*.luau; do
 	m="$(basename "$f")"
 	case "$m" in *.client.luau|*.server.luau) continue ;; esac

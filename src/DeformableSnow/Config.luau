@@ -94,6 +94,13 @@ local Config = {
 	FootstepSoundVolume = 0.35,
 
 	------------------------------------------------------------------ performance
+	-- "Auto": picks a quality level from the device (phone, console, the player's graphics
+	-- setting) and lowers/raises it when the frame rate drops/recovers. Or force one of
+	-- "High", "Medium", "Low", "Potato".
+	Quality = "Auto",
+	-- Seconds after joining during which the loader works harder, so the snow around the player
+	-- is ready almost immediately (it stops early once the nearby snow is built).
+	PreloadSeconds = 6,
 	-- Columns per chunk side: 16, 32 or 64.
 	ChunkCells = 64,
 	-- Level of detail: full detail closer than [1], 1/2 closer than [2], 1/4 closer than [3],

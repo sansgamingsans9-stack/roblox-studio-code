@@ -843,7 +843,43 @@ function AssetService:CreateMeshPartAsync(content, _opts)
 	return mp
 end
 
+-- device facts read by the quality detection (tests change these before requiring SnowClient)
+local UserInputService = { TouchEnabled = false, KeyboardEnabled = true, MouseEnabled = true }
+local GuiService = { tenFoot = false }
+function GuiService.IsTenFootInterface(self)
+	return self.tenFoot
+end
+M.preloaded = {}
+local ContentProvider = {}
+function ContentProvider.PreloadAsync(_self, list)
+	for _, inst in list do
+		table.insert(M.preloaded, inst)
+	end
+	M.task.wait(0)
+end
+local savedQuality = "Enum.SavedQualitySetting.Automatic" -- what the mock Enum hands out
+local UserGameSettings = { SavedQualityLevel = savedQuality }
+function M.setGraphicsLevel(level)
+	if level then
+		UserGameSettings.SavedQualityLevel = { Name = "QualityLevel" .. level, Value = level }
+	else
+		UserGameSettings.SavedQualityLevel = savedQuality
+	end
+end
+M.UserInputService = UserInputService
+M.GuiService = GuiService
+function M.UserSettings()
+	return {
+		GetService = function(_self, name)
+			return assert(name == "UserGameSettings" and UserGameSettings, "no user setting " .. name)
+		end,
+	}
+end
+
 local services = {
+	UserInputService = UserInputService,
+	GuiService = GuiService,
+	ContentProvider = ContentProvider,
 	Workspace = Workspace,
 	ReplicatedStorage = ReplicatedStorage,
 	Players = Players,

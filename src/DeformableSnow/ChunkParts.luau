@@ -96,6 +96,7 @@ export type ChunkParts = typeof(setmetatable(
 		tiles: { [number]: Tile },
 		sampleKey: { number },
 		partCount: number,
+		wedgeCount: number, -- of partCount, how many are triangle WedgeParts
 		ox: number,
 		oz: number,
 		cellW: number,
@@ -168,6 +169,47 @@ local function releaseWedge(p: WedgePart)
 	else
 		p:Destroy()
 	end
+end
+
+--[[
+	Creates Parts ahead of time (calls `budget`, which may yield, between batches) so that the
+	first footprints never stall a frame creating Parts. Pooled Parts are not in the Workspace,
+	so they cost nothing to render.
+]]
+function ChunkParts.prewarm(style: Style, boxes: number, wedges: number, budget: () -> ())
+	local made = 0
+	while #boxPool < boxes do
+		local p = Instance.new("Part")
+		setupPart(p, style)
+		table.insert(boxPool, p)
+		made += 1
+		if made % 25 == 0 then
+			budget()
+		end
+	end
+	while #wedgePool < wedges do
+		local p = Instance.new("WedgePart")
+		setupPart(p, style)
+		table.insert(wedgePool, p)
+		made += 1
+		if made % 25 == 0 then
+			budget()
+		end
+	end
+end
+
+-- Turns snow shadows on/off for the pooled Parts (live chunks use ChunkParts.setShadows).
+function ChunkParts.setPoolShadows(on: boolean)
+	for _, p in boxPool do
+		p.CastShadow = on
+	end
+	for _, p in wedgePool do
+		p.CastShadow = on
+	end
+end
+
+function ChunkParts.poolSize(): (number, number)
+	return #boxPool, #wedgePool
 end
 
 -- CFrame changes of Parts that are already placed, applied in one BulkMoveTo call
@@ -413,6 +455,7 @@ local function releaseTris(self: ChunkParts, tile: Tile)
 		releaseWedge(rec.w2)
 	end
 	self.partCount -= tile.triCount * 2
+	self.wedgeCount -= tile.triCount * 2
 	table.clear(tile.tris)
 	tile.triCount = 0
 end
@@ -693,6 +736,7 @@ local function buildTriangles(self: ChunkParts, tile: Tile, g: number, ti: numbe
 			else
 				local w1, w2 = takeWedge(style), takeWedge(style)
 				self.partCount += 2
+				self.wedgeCount += 2
 				w1.Size, w2.Size = s1, s2
 				w1.CFrame, w2.CFrame = c1, c2
 				w1.Color, w2.Color = colors[level + 1], colors[level + 1]
@@ -710,6 +754,7 @@ local function buildTriangles(self: ChunkParts, tile: Tile, g: number, ti: numbe
 		releaseWedge(rec.w1)
 		releaseWedge(rec.w2)
 		self.partCount -= 2
+		self.wedgeCount -= 2
 	end
 	tile.tris = new
 	tile.triCount = newCount
@@ -895,6 +940,7 @@ function ChunkParts.build(
 		tiles = {},
 		sampleKey = table.create((nSide + 1) * (nSide + 1), NO_KEY),
 		partCount = 0,
+		wedgeCount = 0,
 		ox = chunk.cx * C * S + NUDGE,
 		oz = chunk.cz * C * S + NUDGE,
 		cellW = step * S,
@@ -908,6 +954,22 @@ function ChunkParts.build(
 	rebuildAll(self, src, budget)
 	folder.Parent = style.parent
 	return self, nil
+end
+
+-- Turns shadows on/off for every Part of this chunk.
+function ChunkParts.setShadows(self: ChunkParts, on: boolean)
+	if self.solid then
+		self.solid.CastShadow = on
+	end
+	for _, tile in self.tiles do
+		for _, p in tile.boxes do
+			p.CastShadow = on
+		end
+		for _, rec in tile.tris do
+			rec.w1.CastShadow = on
+			rec.w2.CastShadow = on
+		end
+	end
 end
 
 function ChunkParts.destroy(self: ChunkParts)
