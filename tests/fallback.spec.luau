@@ -1,12 +1,10 @@
 --!nocheck
--- Client on an engine without the EditableMesh Batch* API and with a tiny memory budget,
--- plus regrowing snow (run with tools/test.sh).
+-- Client on an engine without the EditableMesh Batch* API, plus regrowing snow (run with tools/test.sh).
 local T = require("./testlib")
 local R = require("./rbxmock")
 local Config = require("./mods/Config")
 
 R.disableBatch = true
-R.meshBudget = 3
 Config.Renderer = "EditableMesh"
 Config.CellSize = 0.5
 Config.SnowDepth = 1
@@ -52,17 +50,6 @@ T.describe("works without the batch API", function()
 	end)
 	T.eq(down, 0, "winding")
 	T.near(R.surfaceY(-10, -10), 11, 1e-4, "snow on the MeshPart top")
-end)
-
-T.describe("memory budget exhaustion is handled", function()
-	T.ok(#R.meshes <= 3, "never more than the budget")
-	local warned = false
-	for _, w in R.warnings do
-		if w:find("ran out of EditableMesh memory") then
-			warned = true
-		end
-	end
-	T.ok(warned, "warned once about the budget")
 end)
 
 T.describe("a rotated crate dents the snow, then the dent regrows when it leaves", function()

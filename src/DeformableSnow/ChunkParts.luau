@@ -4,15 +4,21 @@
 	Draws one SnowField chunk with ordinary Parts. No EditableMesh, so it works in every
 	published game with no ID verification and no special experience setting.
 
-	* Every snow column is a square cell. Neighbouring cells with the same (quantized) height and
-	  tint are merged into one box ("greedy meshing"), so flat untouched snow costs almost nothing:
-	  a fully untouched chunk is a single Part.
+	* Every snow sample is a square cell centred on it. Neighbouring cells with the same (rounded)
+	  height and tint are merged into one box ("greedy meshing"), so flat untouched snow costs
+	  almost nothing: a fully untouched chunk is a single Part.
 	* Where something pressed the snow, the cells split up into small boxes: footprints get
 	  crisp, steep walls and a flat floor, like real prints in deep snow.
-	* A chunk is split into 16x16-cell tiles; a change only rebuilds the tiles it touched, and a
-	  box that did not change is not touched at all (no property writes).
-	* Parts are pooled and reused instead of being created/destroyed all the time.
+	* A chunk covers exactly its own area (the first and last row/column of cells are half
+	  cells), so chunks drawn at different detail levels tile without gaps or overlaps.
+	* A chunk is split into 16x16-cell tiles. A change only rebuilds the tiles whose visible cells
+	  changed, a box that did not change is not touched at all, moved boxes are batched through
+	  Workspace:BulkMoveTo, and Parts are pooled and reused.
+	* A tile that would need too many boxes (snow on a steep or diagonal slope) rounds its
+	  untouched snow more coarsely (wider terraces) until it fits a budget.
 ]]
+
+local Workspace = game:GetService("Workspace")
 
 local SnowField = require(script.Parent.SnowField)
 
@@ -20,9 +26,17 @@ local readf32 = buffer.readf32
 local NO_SNOW_LIMIT = SnowField.NO_SNOW_LIMIT
 
 local TILE = 16 -- cells per tile side
-local SINK = 0.1 -- boxes reach this far below the part surface so their sides look solid
+local SINK = 0.02 -- boxes reach this far below the ground so their sides look solid
+-- the cell lattice is shifted by this tiny amount so box sides never line up exactly with the
+-- sides of the snow parts (which sit on round coordinates) and flicker
+local NUDGE = 0.0013
+local CLEAR = 0.03 -- the snow top is always at least this far above the ground (no z-fighting)
 local MIN_HEIGHT = 0.05
 local POOL_MAX = 4000
+local MAX_RECTS = 40 -- boxes per tile before untouched snow gets rounded/merged more coarsely
+local MAX_MULT = 16 -- coarsest terrace height: restHeightStep * 16
+local MAX_BLOCK = 4 -- coarsest merge of untouched snow on slopes: 4x4 cells
+local NO_KEY = math.huge -- key cache value for cells without snow
 
 local ChunkParts = {}
 ChunkParts.__index = ChunkParts
@@ -39,6 +53,7 @@ export type Style = {
 	castShadow: boolean,
 	parent: Instance,
 	heightStep: number,
+	restHeightStep: number,
 }
 
 type Tile = {
@@ -47,6 +62,8 @@ type Tile = {
 	size: { Vector3 },
 	cf: { CFrame },
 	level: { number },
+	mult: number,
+	block: number,
 }
 
 type Source = {
@@ -61,6 +78,7 @@ export type ChunkParts = typeof(setmetatable(
 	{} :: {
 		step: number,
 		nSide: number,
+		nCells: number,
 		tilesPerSide: number,
 		usesFull: boolean,
 		gridVersion: number,
@@ -72,10 +90,14 @@ export type ChunkParts = typeof(setmetatable(
 		solidCF: CFrame?,
 		solidLevel: number,
 		tiles: { [number]: Tile },
+		keyCache: { number },
+		partCount: number,
 		ox: number,
 		oz: number,
 		cellW: number,
 		heightStep: number,
+		restStep: number,
+		slopeLimit: number,
 		colors: { Color3 },
 		style: Style,
 	},
@@ -97,6 +119,7 @@ local function takePart(style: Style): Part
 	p.CanCollide = false
 	p.CanQuery = false
 	p.CanTouch = false
+	-- Instance.new parts default to studded top / inlet bottom surfaces
 	p.TopSurface = Enum.SurfaceType.Smooth
 	p.BottomSurface = Enum.SurfaceType.Smooth
 	p.Material = style.material
@@ -116,6 +139,26 @@ local function releasePart(p: Part)
 	else
 		p:Destroy()
 	end
+end
+
+-- CFrame changes of already placed boxes, applied in one BulkMoveTo call
+local moveParts: { BasePart } = {}
+local moveCFrames: { CFrame } = {}
+
+local function flushMoves()
+	local count = #moveParts
+	if count == 0 then
+		return
+	end
+	local ok = count >= 8
+		and pcall(Workspace.BulkMoveTo, Workspace, moveParts, moveCFrames, Enum.BulkMoveMode.FireCFrameChanged)
+	if not ok then
+		for k = 1, count do
+			moveParts[k].CFrame = moveCFrames[k]
+		end
+	end
+	table.clear(moveParts)
+	table.clear(moveCFrames)
 end
 
 ------------------------------------------------------------------ helpers
@@ -138,18 +181,70 @@ local function makeColors(style: Style): { Color3 }
 	return { c, c:Lerp(packed, 1 / 3), c:Lerp(packed, 2 / 3), packed }
 end
 
--- Merge key of a cell: quantized surface height * 4 + tint level (0..3).
-local function cellKey(base: number, rest: number, cur: number, q: number): number
-	local h = math.floor(cur / q + 0.5)
+--[[
+	Merge key of a cell: surface height (in units of q) * 4 + tint level (0..3).
+	Untouched snow is rounded to the coarser `restStep` (a multiple of q) so gentle slopes and the
+	thinning edges merge into a few wide terraces; pressed snow and rims keep the fine step.
+	The drawn top never ends up at or below the ground.
+]]
+local function cellKey(base: number, rest: number, cur: number, q: number, restStep: number): number
+	local restH = math.floor(rest / restStep + 0.5) * restStep
 	local level = 0
+	local hgt
 	if cur < rest - 1e-3 then
 		local depth = rest - base
 		if depth < 0.05 then
 			depth = 0.05
 		end
 		level = math.clamp(math.ceil((rest - cur) / depth * 1.6 * 3), 1, 3)
+		hgt = math.min(math.floor(cur / q + 0.5) * q, restH)
+	elseif cur > rest + 1e-3 then
+		hgt = math.max(math.floor(cur / q + 0.5) * q, restH)
+	else
+		hgt = restH
 	end
-	return h * 4 + level
+	local lowest = math.ceil((base + CLEAR) / q) * q
+	if hgt < lowest then
+		hgt = lowest
+	end
+	return math.floor(hgt / q + 0.5) * 4 + level
+end
+
+--[[
+	Key of cell (ci, cj). Untouched snow in a coarsened tile (block > 1) takes the highest snow of
+	its block x block group of cells, so slopes become bigger steps without the ground poking out.
+]]
+local function keyAt(
+	self: ChunkParts,
+	src: Source,
+	ci: number,
+	cj: number,
+	o: number,
+	b: number,
+	mult: number,
+	block: number
+): number
+	local rest = readf32(src.rest, o)
+	local cur = readf32(src.cur, o)
+	local q, rq = self.heightStep, self.restStep * mult
+	if block > 1 and math.abs(cur - rest) <= 1e-3 then
+		local stride, n, last = src.stride, src.n, self.nSide
+		local bi, bj = ci - ci % block, cj - cj % block
+		local top = rest
+		for j = bj, math.min(last, bj + block - 1) do
+			for i = bi, math.min(last, bi + block - 1) do
+				local o2 = (j * stride * n + i * stride) * 4
+				if readf32(src.base, o2) > NO_SNOW_LIMIT then
+					local r2 = readf32(src.rest, o2)
+					if r2 > top then
+						top = r2
+					end
+				end
+			end
+		end
+		return cellKey(b, top, top, q, rq)
+	end
+	return cellKey(b, rest, cur, q, rq)
 end
 
 -- scratch buffers reused by every tile rebuild (one tile at a time, no yields inside)
@@ -218,22 +313,31 @@ local function greedy(w: number, h: number): number
 end
 
 ------------------------------------------------------------------ boxes
-local function boxFor(self: ChunkParts, ci: number, cj: number, rw: number, rh: number, key: number, minBase: number): (Vector3, CFrame, number)
+-- Box for cells [ci, ci+rw) x [cj, cj+rh). Cell i is centred on sample i; the first and last
+-- cells of a chunk are half cells so the chunk covers exactly its own area.
+local function boxFor(
+	self: ChunkParts,
+	ci: number,
+	cj: number,
+	rw: number,
+	rh: number,
+	key: number,
+	minBase: number
+): (Vector3, CFrame, number)
 	local level = key % 4
 	local top = ((key - level) // 4) * self.heightStep
 	local bottom = minBase - SINK
 	if top - bottom < MIN_HEIGHT then
 		bottom = top - MIN_HEIGHT
 	end
-	local cw = self.cellW
-	local sx, sz = rw * cw, rh * cw
-	local x0 = self.ox + ci * cw
-	local z0 = self.oz + cj * cw
-	return Vector3.new(sx, top - bottom, sz), CFrame.new(x0 + sx * 0.5, (top + bottom) * 0.5, z0 + sz * 0.5), level
-end
-
-local function emptyTile(): Tile
-	return { parts = {}, sig = {}, size = {}, cf = {}, level = {} }
+	local cw, last = self.cellW, self.nSide
+	local x0 = math.max(0, ci - 0.5) * cw
+	local x1 = math.min(last, ci + rw - 0.5) * cw
+	local z0 = math.max(0, cj - 0.5) * cw
+	local z1 = math.min(last, cj + rh - 0.5) * cw
+	return Vector3.new(x1 - x0, top - bottom, z1 - z0),
+		CFrame.new(self.ox + (x0 + x1) * 0.5, (top + bottom) * 0.5, self.oz + (z0 + z1) * 0.5),
+		level
 end
 
 local function releaseTile(tile: Tile)
@@ -247,39 +351,111 @@ local function releaseTile(tile: Tile)
 	table.clear(tile.level)
 end
 
--- Reads one tile's cells into the scratch buffers. Returns w, h.
-local function gather(self: ChunkParts, src: Source, ti: number, tj: number): (number, number)
+--[[
+	Reads one tile's cells into the scratch buffers (and the key cache). Returns w, h.
+	The base stored per cell is the lowest ground among the cell and its neighbours (unless a
+	neighbour is a cliff), so on slopes every box reaches down to its lower neighbour: no gaps.
+]]
+local function gather(
+	self: ChunkParts,
+	src: Source,
+	ti: number,
+	tj: number,
+	mult: number,
+	block: number
+): (number, number, boolean)
 	local i0, j0 = ti * TILE, tj * TILE
-	local w = math.min(TILE, self.nSide - i0)
-	local h = math.min(TILE, self.nSide - j0)
-	local q = self.heightStep
+	local nCells, last = self.nCells, self.nSide
+	local w = math.min(TILE, nCells - i0)
+	local h = math.min(TILE, nCells - j0)
 	local stride, n = src.stride, src.n
+	local baseB = src.base
+	local cache = self.keyCache
+	local limit = self.slopeLimit
+	local restLo, restHi = math.huge, -math.huge
 	for j = 0, h - 1 do
-		local rowO = (j0 + j) * stride * n
+		local cj = j0 + j
+		local rowO = cj * stride * n
+		local cacheRow = cj * nCells + i0 + 1
 		for i = 0, w - 1 do
-			local o = (rowO + (i0 + i) * stride) * 4
+			local ci = i0 + i
+			local o = (rowO + ci * stride) * 4
 			local idx = j * w + i + 1
-			local b = readf32(src.base, o)
+			local b = readf32(baseB, o)
 			if b > NO_SNOW_LIMIT then
-				keys[idx] = cellKey(b, readf32(src.rest, o), readf32(src.cur, o), q)
-				bases[idx] = b
+				local k = keyAt(self, src, ci, cj, o, b, mult, block)
+				keys[idx] = k
+				if k % 4 == 0 then
+					if k < restLo then
+						restLo = k
+					end
+					if k > restHi then
+						restHi = k
+					end
+				end
+				cache[cacheRow + i] = k
+				local low = b
+				if ci > 0 then
+					local nb = readf32(baseB, o - stride * 4)
+					if nb > NO_SNOW_LIMIT and nb < low and b - nb <= limit then
+						low = nb
+					end
+				end
+				if ci < last then
+					local nb = readf32(baseB, o + stride * 4)
+					if nb > NO_SNOW_LIMIT and nb < low and b - nb <= limit then
+						low = nb
+					end
+				end
+				if cj > 0 then
+					local nb = readf32(baseB, o - stride * n * 4)
+					if nb > NO_SNOW_LIMIT and nb < low and b - nb <= limit then
+						low = nb
+					end
+				end
+				if cj < last then
+					local nb = readf32(baseB, o + stride * n * 4)
+					if nb > NO_SNOW_LIMIT and nb < low and b - nb <= limit then
+						low = nb
+					end
+				end
+				bases[idx] = low
 			else
 				keys[idx] = false
+				cache[cacheRow + i] = NO_KEY
 			end
 		end
 	end
-	return w, h
+	-- coarser rounding/merging can only help where untouched snow is not one flat level
+	return w, h, restHi > restLo
 end
 
 local function rebuildTile(self: ChunkParts, src: Source, ti: number, tj: number)
-	local w, h = gather(self, src, ti, tj)
+	local mult, block = 1, 1
+	local w, h, varies = gather(self, src, ti, tj, mult, block)
 	local count = greedy(w, h)
+	-- too many boxes (steep / diagonal / curved snow): first round untouched snow to taller
+	-- terraces, then merge it in bigger blocks. Prints keep full detail. Flat snow with many
+	-- prints is left alone (coarser rounding would not change anything there).
+	while count > MAX_RECTS and varies do
+		if mult < MAX_MULT then
+			mult *= 2
+		elseif block < MAX_BLOCK then
+			block *= 2
+		else
+			break
+		end
+		w, h, varies = gather(self, src, ti, tj, mult, block)
+		count = greedy(w, h)
+	end
+
 	local tileIndex = tj * self.tilesPerSide + ti
 	local tile = self.tiles[tileIndex]
 	if not tile then
-		tile = emptyTile()
+		tile = { parts = {}, sig = {}, size = {}, cf = {}, level = {}, mult = mult, block = block }
 		self.tiles[tileIndex] = tile
 	end
+	tile.mult, tile.block = mult, block
 
 	-- keep parts whose rectangle did not move; hand the rest out to the new rectangles
 	local bySig: { [number]: number } = {}
@@ -331,41 +507,48 @@ local function rebuildTile(self: ChunkParts, src: Source, ti: number, tj: number
 		if oldSize ~= size then
 			p.Size = size
 		end
-		if oldCF ~= cf then
-			p.CFrame = cf
-		end
 		if oldLevel ~= level then
 			p.Color = colors[level + 1]
 		end
 		if oldSize == nil then
+			-- fresh from the pool: place it, then show it
+			p.CFrame = cf
 			p.Parent = folder
+		elseif oldCF ~= cf then
+			table.insert(moveParts, p)
+			table.insert(moveCFrames, cf)
 		end
 		local idx = r + 1
 		newParts[idx], newSize[idx], newCF[idx], newLevel[idx] = p, size, cf, level
 		newSig[idx] = ri + rj * 32 + rw * 1024 + rh * 32768
 	end
+	flushMoves()
 	for _, k in free do
 		releasePart(tile.parts[k])
 	end
+	self.partCount += count - #tile.parts
 
 	tile.parts, tile.sig, tile.size, tile.cf, tile.level = newParts, newSig, newSize, newCF, newLevel
 end
 
 -- If every cell of the chunk has snow at the same height/tint, returns that key and min base.
 local function uniformKey(self: ChunkParts, src: Source): (number?, number)
-	local q = self.heightStep
+	local q, rq = self.heightStep, self.restStep
 	local stride, n = src.stride, src.n
+	local cache, nCells = self.keyCache, self.nCells
 	local key: number? = nil
 	local minB = math.huge
-	for j = 0, self.nSide - 1 do
+	for j = 0, nCells - 1 do
 		local rowO = j * stride * n
-		for i = 0, self.nSide - 1 do
+		for i = 0, nCells - 1 do
 			local o = (rowO + i * stride) * 4
 			local b = readf32(src.base, o)
 			if b <= NO_SNOW_LIMIT then
+				cache[j * nCells + i + 1] = NO_KEY
 				return nil, 0
 			end
-			local k = cellKey(b, readf32(src.rest, o), readf32(src.cur, o), q)
+			local k = cellKey(b, readf32(src.rest, o), readf32(src.cur, o), q, rq)
+			cache[j * nCells + i + 1] = k
 			if key == nil then
 				key = k
 			elseif k ~= key then
@@ -384,12 +567,15 @@ local function setSolid(self: ChunkParts, key: number, minB: number)
 		releaseTile(tile)
 	end
 	table.clear(self.tiles)
-	local size, cf, level = boxFor(self, 0, 0, self.nSide, self.nSide, key, minB)
+	self.partCount = 1
+	local size, cf, level = boxFor(self, 0, 0, self.nCells, self.nCells, key, minB)
 	local p = self.solid
+	local fresh = false
 	if not p then
 		p = takePart(self.style)
 		self.solid = p
 		self.solidSize, self.solidCF, self.solidLevel = nil, nil, -1
+		fresh = true
 	end
 	local part = p :: Part
 	if self.solidSize ~= size then
@@ -404,13 +590,16 @@ local function setSolid(self: ChunkParts, key: number, minB: number)
 		part.Color = self.colors[level + 1]
 		self.solidLevel = level
 	end
-	part.Parent = self.folder
+	if fresh then
+		part.Parent = self.folder
+	end
 end
 
 local function clearSolid(self: ChunkParts)
 	local p = self.solid
 	if p then
 		releasePart(p)
+		self.partCount -= 1
 		self.solid = nil
 		self.solidSize, self.solidCF, self.solidLevel = nil, nil, -1
 	end
@@ -453,12 +642,13 @@ function ChunkParts.build(
 	local p = field.params
 	local C, S = p.chunkCells, p.cellSize
 	local nSide = C // step
+	local nCells = nSide + 1
 
 	-- any snow at all?
 	local any = false
-	for j = 0, nSide - 1 do
+	for j = 0, nSide do
 		local rowO = j * src.stride * src.n
-		for i = 0, nSide - 1 do
+		for i = 0, nSide do
 			if readf32(src.base, (rowO + i * src.stride) * 4) > NO_SNOW_LIMIT then
 				any = true
 				break
@@ -474,13 +664,14 @@ function ChunkParts.build(
 
 	local folder = Instance.new("Folder")
 	folder.Name = `SnowChunk_{chunk.cx}_{chunk.cz}`
+	local q = math.max(0.005, style.heightStep)
+	local cellW = step * S
 
-	-- cell (i, j) covers columns [i*step, (i+1)*step) of the chunk, each column being a
-	-- CellSize square centred on its grid point; neighbouring chunks tile without gaps
 	local self = setmetatable({
 		step = step,
 		nSide = nSide,
-		tilesPerSide = math.ceil(nSide / TILE),
+		nCells = nCells,
+		tilesPerSide = math.ceil(nCells / TILE),
 		usesFull = chunk.full ~= nil,
 		gridVersion = chunk.gridVersion,
 		version = chunk.version,
@@ -491,10 +682,15 @@ function ChunkParts.build(
 		solidCF = nil,
 		solidLevel = -1,
 		tiles = {},
-		ox = chunk.cx * C * S - S * 0.5,
-		oz = chunk.cz * C * S - S * 0.5,
-		cellW = step * S,
-		heightStep = math.max(0.005, style.heightStep),
+		keyCache = table.create(nCells * nCells, NO_KEY),
+		partCount = 0,
+		ox = chunk.cx * C * S + NUDGE,
+		oz = chunk.cz * C * S + NUDGE,
+		cellW = cellW,
+		heightStep = q,
+		restStep = q * math.max(1, math.floor(style.restHeightStep / q + 0.5)),
+		-- neighbours lower than this are cliffs, not slope (about 63 degrees over one cell)
+		slopeLimit = cellW * 2,
 		colors = makeColors(style),
 		style = style,
 	}, ChunkParts)
@@ -544,26 +740,40 @@ function ChunkParts.applyDirty(
 		return
 	end
 
-	local changed = false
+	local sawChange = false
 	if dirty then
 		local n = full.n
-		local C = n - 1
 		local step = self.step
 		local tps = self.tilesPerSide
+		local nCells = self.nCells
+		local cache = self.keyCache
 		local marked: { [number]: boolean } = {}
 		local any = false
 		for i, flag in dirty do
 			if flag == 1 then
+				sawChange = true
 				local lx, lz = i % n, i // n
-				-- column C belongs to the next chunk; at coarse detail only aligned columns are drawn
-				if lx < C and lz < C and lx % step == 0 and lz % step == 0 then
-					marked[((lz // step) // TILE) * tps + (lx // step) // TILE] = true
-					any = true
+				-- at lower detail only every step-th column is drawn
+				if lx % step == 0 and lz % step == 0 then
+					local ci, cj = lx // step, lz // step
+					local tileIndex = (cj // TILE) * tps + ci // TILE
+					local tile = self.tiles[tileIndex]
+					local o = i * 4
+					local b = readf32(full.base, o)
+					local k = if b > NO_SNOW_LIMIT
+						then keyAt(self, src, ci, cj, o, b, if tile then tile.mult else 1, if tile then tile.block else 1)
+						else NO_KEY
+					local c = cj * nCells + ci + 1
+					-- only cells whose visible height or tint changed need their tile rebuilt
+					if cache[c] ~= k then
+						cache[c] = k
+						marked[tileIndex] = true
+						any = true
+					end
 				end
 			end
 		end
 		if any then
-			changed = true
 			if self.solid then
 				-- the chunk was one flat box: split it into tiles
 				clearSolid(self)
@@ -581,7 +791,7 @@ function ChunkParts.applyDirty(
 	end
 
 	-- everything back to rest: collapse into a single box again if possible
-	if changed and full.activeCount == 0 and not self.solid then
+	if sawChange and full.activeCount == 0 and not self.solid then
 		local key, minB = uniformKey(self, src)
 		if key then
 			setSolid(self, key, minB)

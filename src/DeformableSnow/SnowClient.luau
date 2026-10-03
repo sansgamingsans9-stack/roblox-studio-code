@@ -44,6 +44,8 @@ type Renderer = {
 	gridVersion: number,
 	version: number,
 	usesFull: boolean,
+	partCount: number?, -- Parts renderer only
+	solid: any?, -- Parts renderer only: the chunk is one single box
 	destroy: (self: any) -> (),
 	applyDirty: (
 		self: any,
@@ -60,6 +62,7 @@ type RenderState = {
 	wantStep: number,
 	wantFull: boolean,
 	priority: number,
+	dist: number,
 	building: boolean,
 	failedUntil: number,
 	emptyVersion: number,
@@ -96,6 +99,7 @@ local CHUNK_SPAN = CELL * CHUNK_CELLS
 local LOD1 = Config.LodDistances[1] or 64
 local LOD2 = Config.LodDistances[2] or 128
 local LOD3 = Config.LodDistances[3] or 256
+local NEAR_KEEP = 16 -- the Parts budget never lowers the detail of snow this close to the camera
 local DATA_DISTANCE = LOD1 -- chunks closer than this are always simulated (others only where needed)
 local SIM_DIST2 = Config.SimulationDistance * Config.SimulationDistance
 local BUDGET = math.max(0.5, Config.FrameBudgetMs) / 1000
@@ -135,7 +139,6 @@ overlapParams.FilterType = Enum.RaycastFilterType.Exclude
 local camPos = Vector3.zero
 local stopped = false
 local consecutiveErrors = 0
-local warnedBudget = false
 
 local remote: RemoteEvent? = nil
 local partsReady = false
@@ -195,6 +198,7 @@ local function getState(chunk: Chunk): RenderState
 			wantStep = 0,
 			wantFull = false,
 			priority = math.huge,
+			dist = math.huge,
 			building = false,
 			failedUntil = 0,
 			emptyVersion = -1,
@@ -536,6 +540,7 @@ local function doWork(chunk: Chunk, rs: RenderState)
 	rs.building = true
 	-- (no `:: any` directly on the calls: that would drop their second return value)
 	local mesh: Renderer?, reason: string?
+	local builtWithParts = useParts
 	if useParts then
 		local built, why = ChunkParts.build(field, chunk, step, style, budget)
 		mesh, reason = built :: any, why
@@ -543,17 +548,17 @@ local function doWork(chunk: Chunk, rs: RenderState)
 		local built, why = ChunkMesh.build(field, chunk, step, style, budget)
 		mesh, reason = built :: any, why
 		if reason == "budget" then
-			-- this device is out of EditableMesh memory: draw this chunk with Parts instead
+			-- this device is out of EditableMesh memory: draw everything with Parts (mixing the two
+			-- renderers would leave seams, they line up differently at chunk borders)
+			switchToParts("This device ran out of EditableMesh memory.")
 			local built2, why2 = ChunkParts.build(field, chunk, step, style, budget)
 			mesh, reason = built2 :: any, why2
-			if not warnedBudget then
-				warnedBudget = true
-				warn("[DeformableSnow] this device ran out of EditableMesh memory; some chunks use Parts instead.")
-			end
+			builtWithParts = true
 		end
 	end
 	rs.building = false
-	if not alive(chunk) or stopped then
+	if not alive(chunk) or stopped or (useParts and not builtWithParts) then
+		-- gone, or we switched to Parts while this EditableMesh was being built: never mix them
 		if mesh then
 			mesh:destroy()
 		end
@@ -609,20 +614,23 @@ local function workerLoop()
 			end
 			local target = picked :: Chunk
 			local rs = getState(target)
-			local before: { any } = { target.gridVersion, rs.mesh, target.full, target.stale, rs.emptyVersion, next(target.coarse) }
+			local wasParts = useParts
+			local before: { any } =
+				{ target.gridVersion, rs.mesh, target.full, target.stale, rs.emptyVersion, rs.emptyStep, next(target.coarse) }
 			local ok, err = pcall(function()
 				doWork(target, rs)
 			end)
 			-- safety net: never spin on a chunk whose work did not change anything
-			local after: { any } = { target.gridVersion, rs.mesh, target.full, target.stale, rs.emptyVersion, next(target.coarse) }
+			local after: { any } =
+				{ target.gridVersion, rs.mesh, target.full, target.stale, rs.emptyVersion, rs.emptyStep, next(target.coarse) }
 			local same = true
-			for k = 1, 6 do
+			for k = 1, 7 do
 				if before[k] ~= after[k] then
 					same = false
 				end
 			end
-			if same and ok then
-				rs.failedUntil = now() + 1
+			if same and ok and wasParts == useParts then
+				rs.failedUntil = math.max(rs.failedUntil, now() + 1)
 			end
 			if not ok then
 				warn("[DeformableSnow] loader error:", err)
@@ -639,10 +647,60 @@ local function workerLoop()
 end
 
 ------------------------------------------------------------------------ planning (4x per second)
+local overBudget = false
+
+-- Parts renderer budget: nearest chunks first; once the estimated number of snow Parts passes
+-- MaxSnowParts, farther chunks get coarser detail, and finally none. Snow closer than NEAR_KEEP
+-- studs is never reduced. Hysteresis keeps it from flapping.
+local function applyPartBudget(all: { Chunk })
+	table.sort(all, function(a: Chunk, b: Chunk)
+		return (a.render :: RenderState).dist < (b.render :: RenderState).dist
+	end)
+	local cap = Config.MaxSnowParts * (if overBudget then 0.9 else 1)
+	local used = 0
+	local capped = false
+	for _, chunk in all do
+		local rs = chunk.render :: RenderState
+		local want = rs.wantStep
+		if want > 0 then
+			local mesh = rs.mesh
+			local est = 1
+			if mesh and mesh.partCount then
+				-- a single-box chunk stays one box at any detail; otherwise ~4x per detail level
+				est = if mesh.solid then 1 else math.max(1, mesh.partCount * (mesh.step / want) ^ 2)
+			end
+			if rs.dist >= NEAR_KEEP then
+				while used + est > cap and want < 8 do
+					want *= 2
+					est = math.max(1, est / 4)
+				end
+				if used + est > cap and not (rs.emptyVersion == chunk.gridVersion) then
+					want = 0
+				end
+			end
+			if want ~= rs.wantStep then
+				capped = true
+				rs.wantStep = want
+			end
+			if want > 0 then
+				used += est
+			end
+		end
+	end
+	overBudget = capped
+	if capped and not warnedParts then
+		warnedParts = true
+		warn(
+			`[DeformableSnow] more than MaxSnowParts ({Config.MaxSnowParts}) snow Parts needed; `
+				.. "far snow is drawn with less detail. Raise CellSize or MaxSnowParts if this looks bad."
+		)
+	end
+end
+
 local function plan()
 	local t = now()
 	local halfSpan = CHUNK_SPAN * 0.5
-	local list = {}
+	local all: { Chunk } = {}
 	for _, chunk in field.chunks do
 		local rs = getState(chunk)
 		local cxw, czw = field:chunkCenter(chunk)
@@ -660,6 +718,7 @@ local function plan()
 		end
 		local dy = if camPos.Y < lo then lo - camPos.Y elseif camPos.Y > hi then camPos.Y - hi else 0
 		local dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+		rs.dist = dist
 		-- chunks someone is about to step into jump the queue
 		rs.priority = if not full and (t - chunk.lastNeeded) < 3 then dist - 100000 else dist
 
@@ -675,26 +734,30 @@ local function plan()
 		else
 			step = 8
 		end
-		if step > 0 and useParts and not rs.mesh and dist >= LOD2 and ChunkParts.liveCount > Config.MaxSnowParts then
-			-- too many snow Parts already: don't add far-away chunks
-			step = 0
-			if not warnedParts then
-				warnedParts = true
-				warn(`[DeformableSnow] over MaxSnowParts ({Config.MaxSnowParts}); far snow is not drawn. Raise CellSize or MaxSnowParts.`)
-			end
-		end
 		rs.wantStep = step
 		rs.wantFull = dist < DATA_DISTANCE or (t - chunk.lastNeeded) < 3
+		table.insert(all, chunk)
+	end
 
-		if step == 0 and rs.mesh and not rs.building then
+	if useParts then
+		applyPartBudget(all)
+	end
+
+	local list = {}
+	for _, chunk in all do
+		local rs = chunk.render :: RenderState
+		local full = chunk.full
+		if rs.wantStep == 0 and rs.mesh and not rs.building then
 			destroyRender(chunk)
 		end
-		if step == 0 and not full then
+		-- far beyond the render distance: forget the low-detail surface too
+		-- (not when it is only held back by the Parts budget, it would just be sampled again)
+		if rs.dist > Config.MaxRenderDistance and not full then
 			chunk.coarse = {}
 		end
 		-- forget simulations that are far away and fully regrown
 		if full and not rs.wantFull and full.activeCount == 0 and not chunk.stale
-			and dist > DATA_DISTANCE * 1.25 and not rs.building
+			and rs.dist > DATA_DISTANCE * 1.25 and not rs.building
 		then
 			field:dropFull(chunk)
 		end
@@ -1228,7 +1291,8 @@ local function flushMeshes()
 				end
 			end
 			for i, flag in dirty do
-				if flag == 1 then
+				-- neighbour pokes only refresh mesh shading; the Parts renderer has none
+				if flag == 1 and not useParts then
 					local lx, lz = i % n, i // n
 					if lx > 0 and lx <= 8 then
 						pokeNeighbor(chunk, -1, 0, lz * n + C)
@@ -1370,6 +1434,7 @@ function SnowClient.start()
 		materialVariant = Config.MaterialVariant,
 		studsPerTile = math.max(0.5, Config.TextureStudsPerTile),
 		heightStep = math.max(0.005, Config.PartsHeightStep),
+		restHeightStep = math.max(0.005, Config.PartsRestHeightStep),
 		castShadow = Config.CastShadow,
 		parent = renderFolder,
 	}

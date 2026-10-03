@@ -362,6 +362,9 @@ Imt.__newindex = function(self, k, v)
 		props.WorldPosition = v
 		return
 	end
+	if props.Name == "Snow" and (k == "Size" or k == "CFrame" or k == "Color") then
+		M.snowWrites = (M.snowWrites or 0) + 1
+	end
 	props[k] = v
 	local s = rawget(self, "_signals")["prop:" .. k]
 	if s then
@@ -587,6 +590,15 @@ function methods.Raycast(_self, origin, dir, params)
 		return nil
 	end
 	return { Instance = best, Position = origin + dir * bestT, Normal = v3(0, 1, 0) }
+end
+
+function methods.BulkMoveTo(_self, parts, cframes, _mode)
+	assert(#parts == #cframes, "BulkMoveTo: lists differ in length")
+	M.bulkMoves = (M.bulkMoves or 0) + 1
+	for i, p in parts do
+		assert(methods.IsDescendantOf(p, Workspace), "BulkMoveTo: part not in Workspace")
+		p.CFrame = cframes[i]
+	end
 end
 
 function methods.GetPartBoundsInBox(_self, cf, size, params)

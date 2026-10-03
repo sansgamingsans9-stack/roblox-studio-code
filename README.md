@@ -66,8 +66,9 @@ files become RunContext scripts).
 | --- | --- | --- |
 | `SnowFolderName` | `"SnowParts"` | Folder in Workspace that holds the snow parts |
 | `Renderer` | `"Parts"` | `"Parts"` or `"EditableMesh"` (see [Renderers](#renderers)) |
-| `PartsHeightStep` | `0.04` | Parts renderer: heights are rounded to this so flat snow merges into big boxes |
-| `MaxSnowParts` | `12000` | Parts renderer: no new far-away chunks are drawn above this many snow Parts |
+| `PartsHeightStep` | `0.04` | Parts renderer: pressed snow is rounded to this height step |
+| `PartsRestHeightStep` | `0.2` | Parts renderer: untouched snow is rounded to this coarser step, so slopes become a few wide terraces |
+| `MaxSnowParts` | `12000` | Parts renderer: above this many snow Parts, far snow gets less detail (snow within 16 studs of the camera is never reduced) |
 | `SnowDepth` | `1.0` | Studs of snow on top of each part |
 | `CellSize` | `0.25` | Grid spacing. Smaller means sharper prints but more Parts/memory. `0.2`–`1` |
 | `EdgeFalloff` | `1.5` | Snow thins out over this distance at the edges |
@@ -113,10 +114,17 @@ files become RunContext scripts).
    that vertical line and pushes the snow down to there (never below the ground). A rim is pushed up
    around the print.
 4. **Drawing.** Each 16×16-stud chunk is drawn by one of two renderers:
-   - **Parts** (default): every snow column is a square cell. Neighbouring cells at the same height
-     and tint merge into one box (greedy meshing), per 4×4-stud tile. A change only rebuilds the
-     tiles it touched, unchanged boxes are never written to, and Parts are pooled and reused.
-     Chunks at different detail levels tile without gaps, and boxes never overlap.
+   - **Parts** (default): every snow sample is a square cell. Neighbouring cells at the same
+     height and tint merge into one box (greedy meshing), per 4×4-stud tile.
+     - A tile is rebuilt only when one of its cells visibly changes (cached per cell), unchanged
+       boxes are never written to, moved boxes go through `Workspace:BulkMoveTo`, and Parts are
+       pooled and reused.
+     - Chunks at every detail level cover exactly their own area: no gaps, no overlaps. Boxes reach
+       down to their lowest neighbour, so slopes have no gaps either.
+     - Snow tops never sit on a part's surface, and box sides are nudged off part edges, so
+       nothing z-fights.
+     - Tiles that would need too many boxes (steep, diagonal or curved snow) use taller terraces
+       and then merge untouched snow in bigger blocks. Prints keep full detail.
    - **EditableMesh**: one mesh per chunk shown through `AssetService:CreateMeshPartAsync`. Normals
      come from the heightfield (seamless shading), thin "skirts" hide cracks between detail levels,
      and two sub-pixel triangles pin each mesh's bounding box so it never shifts while it deforms.
@@ -134,20 +142,27 @@ files become RunContext scripts).
 - Snow parts are meant to be mostly static. Moving or resizing one works, but the snow around it is
   re-read.
 - MeshPart wheels are treated as boxes. Use Part cylinders for perfect ruts.
-- Parts renderer: snow on slopes looks terraced (stair-stepped), and prints have pixel-stepped
-  outlines at `CellSize` resolution. Lower `CellSize` for finer prints (more Parts).
+- Parts renderer: snow on slopes and curved parts looks terraced (stair-stepped), and steep or
+  diagonal hills get coarser steps to keep the Part count down (at most about 570 Parts per
+  16×16-stud chunk; flat snow is 1 Part per chunk). Prints have pixel-stepped outlines at
+  `CellSize` resolution. Lower `CellSize` for finer prints (more Parts).
+- Parts renderer: Roblox maps the Snow material per Part with a random offset, so you may see
+  faint texture seams between boxes. `Material = Enum.Material.SmoothPlastic` is perfectly
+  seamless.
 - EditableMesh renderer: on low-memory devices Roblox may refuse more editable meshes. The affected
   chunks are then drawn with Parts instead, and a warning is printed once.
 
 ## Development
 
 - `tools/test.sh` runs the offline test suite with the [`luau`](https://github.com/luau-lang/luau)
-  CLI: 154 checks across 7 suites.
+  CLI: 214 checks across 10 suites.
   - Unit tests for the geometry, heightfield and network codec.
   - End-to-end runs of the real client and server code against a small Roblox engine mock
     (`tests/rbxmock.luau`), for both renderers. That includes a game where EditableMesh is blocked
-    (automatic switch to Parts) and checks that snow boxes never overlap. The mock's
-    `EditableMesh` rejects invalid or mixed-up ids like the real one.
+    (automatic switch to Parts), running out of EditableMesh memory, the Parts budget, and the
+    Parts geometry (tiling at every detail level, no gaps or z-fighting on slopes, bounded Part
+    counts on diagonal slopes, no updates for invisible changes). The mock's `EditableMesh`
+    rejects invalid or mixed-up ids like the real one.
 
   ```sh
   LUAU=/path/to/luau tools/test.sh

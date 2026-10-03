@@ -22,9 +22,12 @@ local Config = {
 	-- "EditableMesh": smooth mesh surface. Needs "Enable Mesh / Image APIs" in published games
 	--          (owner must be 13+ and ID verified). Falls back to "Parts" automatically when blocked.
 	Renderer = "Parts",
-	-- Parts renderer: snow heights are rounded to this step so flat areas merge into big boxes.
+	-- Parts renderer: pressed snow is rounded to this height step (finer = smoother prints).
 	PartsHeightStep = 0.04,
-	-- Parts renderer: no new far-away chunks are drawn once this many snow Parts exist.
+	-- Parts renderer: untouched snow is rounded to this coarser step, so slopes and the thinning
+	-- edges become a few wide terraces instead of thousands of tiny boxes.
+	PartsRestHeightStep = 0.2,
+	-- Parts renderer: above this many snow Parts, far snow is drawn with less detail.
 	MaxSnowParts = 12000,
 
 	------------------------------------------------------------------ look
