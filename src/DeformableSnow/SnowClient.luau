@@ -23,6 +23,7 @@ local ChunkMesh = require(script.Parent.ChunkMesh)
 local ChunkParts = require(script.Parent.ChunkParts)
 local StampCodec = require(script.Parent.StampCodec)
 local Quality = require(script.Parent.Quality)
+local SnowWeather = require(script.Parent.SnowWeather)
 
 type Chunk = SnowField.Chunk
 
@@ -1921,6 +1922,7 @@ local function applyTier(index: number)
 		end)
 	end
 	renderFolder:SetAttribute("SnowQuality", tier.name)
+	SnowWeather.setTier(tier)
 	task.spawn(prewarmPool)
 	if Config.Debug then
 		print(`[DeformableSnow] quality -> {tier.name}`)
@@ -2085,6 +2087,22 @@ function SnowClient.start()
 		parent = renderFolder,
 	}
 	setupEffects()
+	-- falling snow, fog, winter light, lens flares (Config.Weather)
+	task.spawn(function()
+		local ok, err = pcall(function()
+			SnowWeather.start({
+				tier = tier,
+				surfaceAt = function(x: number, z: number): number?
+					local base, _, cur = field:columnAt(x, z)
+					return if base then cur else nil
+				end,
+				exclude = { renderFolder :: Instance },
+			})
+		end)
+		if not ok then
+			warn("[DeformableSnow] weather: " .. tostring(err))
+		end
+	end)
 	renderFolder:SetAttribute("SnowQuality", tier.name)
 	renderFolder:SetAttribute("SnowReady", false)
 	-- particle/sound assets load in the background so the first puff is not blank

@@ -6,6 +6,8 @@
    {"name":"SnowField","className":"ModuleScript","filePaths":["src/DeformableSnow/SnowField.luau"]},
    {"name":"StampCodec","className":"ModuleScript","filePaths":["src/DeformableSnow/StampCodec.luau"]},
    {"name":"Quality","className":"ModuleScript","filePaths":["src/DeformableSnow/Quality.luau"]},
+   {"name":"WeatherModel","className":"ModuleScript","filePaths":["src/DeformableSnow/WeatherModel.luau"]},
+   {"name":"SnowWeather","className":"ModuleScript","filePaths":["src/DeformableSnow/SnowWeather.luau"]},
    {"name":"ChunkParts","className":"ModuleScript","filePaths":["src/DeformableSnow/ChunkParts.luau"]},
    {"name":"ChunkMesh","className":"ModuleScript","filePaths":["src/DeformableSnow/ChunkMesh.luau"]},
    {"name":"SnowClient","className":"ModuleScript","filePaths":["src/DeformableSnow/SnowClient.luau"]},

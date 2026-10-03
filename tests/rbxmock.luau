@@ -48,6 +48,9 @@ V3mt.__mul = function(a, b)
 	end
 	return v3(a.X * b.X, a.Y * b.Y, a.Z * b.Z)
 end
+V3mt.__div = function(a, b)
+	return v3(a.X / b, a.Y / b, a.Z / b)
+end
 V3mt.__eq = function(a, b)
 	return a.X == b.X and a.Y == b.Y and a.Z == b.Z
 end
@@ -56,8 +59,26 @@ V3mt.__tostring = function(t)
 end
 Vector3.new = v3
 Vector3.zero = v3(0, 0, 0)
+Vector3.one = v3(1, 1, 1)
+Vector3.yAxis = v3(0, 1, 0)
 M.Vector3 = Vector3
 
+M.UDim2 = {
+	new = function(sx, ox, sy, oy)
+		return { X = { Scale = sx or 0, Offset = ox or 0 }, Y = { Scale = sy or 0, Offset = oy or 0 } }
+	end,
+	fromScale = function(sx, sy)
+		return { X = { Scale = sx or 0, Offset = 0 }, Y = { Scale = sy or 0, Offset = 0 } }
+	end,
+	fromOffset = function(ox, oy)
+		return { X = { Scale = 0, Offset = ox or 0 }, Y = { Scale = 0, Offset = oy or 0 } }
+	end,
+}
+M.UDim = {
+	new = function(s, o)
+		return { Scale = s or 0, Offset = o or 0 }
+	end,
+}
 M.Vector2 = {
 	new = function(x, y)
 		return { X = x or 0, Y = y or 0 }
@@ -72,6 +93,12 @@ CFmt.__index = function(t, k)
 		return function(self)
 			return table.unpack(self.c)
 		end
+	elseif k == "LookVector" then
+		return v3(-t.c[6], -t.c[9], -t.c[12])
+	elseif k == "RightVector" then
+		return v3(t.c[4], t.c[7], t.c[10])
+	elseif k == "UpVector" then
+		return v3(t.c[5], t.c[8], t.c[11])
 	end
 	return nil
 end
@@ -85,6 +112,10 @@ CFmt.__eq = function(a, b)
 end
 local CFrame = {}
 function CFrame.new(x, y, z, ...)
+	if type(x) == "table" then
+		-- CFrame.new(position)
+		return setmetatable({ c = { x.X, x.Y, x.Z, 1, 0, 0, 0, 1, 0, 0, 0, 1 } }, CFmt)
+	end
 	local rest = { ... }
 	if #rest == 9 then
 		return setmetatable({ c = { x, y, z, table.unpack(rest) } }, CFmt)
@@ -94,6 +125,17 @@ end
 function CFrame.fromMatrix(pos, vx, vy, vz)
 	vz = vz or vx:Cross(vy)
 	return setmetatable({ c = { pos.X, pos.Y, pos.Z, vx.X, vy.X, vz.X, vx.Y, vy.Y, vz.Y, vx.Z, vy.Z, vz.Z } }, CFmt)
+end
+-- camera at `pos` looking at `at`
+function CFrame.lookAt(pos, at)
+	local look = (at - pos).Unit
+	local up = v3(0, 1, 0)
+	if math.abs(look.Y) > 0.999 then
+		up = v3(0, 0, 1)
+	end
+	local right = look:Cross(up).Unit
+	local up2 = right:Cross(look)
+	return CFrame.fromMatrix(pos, right, up2, -look)
 end
 -- rotation about Y (enough for the tests)
 function CFrame.yaw(x, y, z, a)
@@ -132,7 +174,15 @@ M.Content = {
 	end,
 }
 
-M.Enum = setmetatable({}, {
+M.Enum = setmetatable({
+	RenderPriority = {
+		First = { Name = "First", Value = 0 },
+		Input = { Name = "Input", Value = 100 },
+		Camera = { Name = "Camera", Value = 200 },
+		Character = { Name = "Character", Value = 300 },
+		Last = { Name = "Last", Value = 2000 },
+	},
+}, {
 	__index = function(_, enumName)
 		return setmetatable({}, {
 			__index = function(_, item)
@@ -258,6 +308,27 @@ local function defaults(cls)
 		p.RootPart = nil
 	elseif cls == "Camera" then
 		p.CFrame = CFrame.new()
+		p.FieldOfView = 70
+		p.ViewportSize = M.Vector2.new(1280, 720)
+	elseif cls == "Lighting" then
+		p.Ambient = M.Color3.new(0.27, 0.27, 0.27)
+		p.OutdoorAmbient = M.Color3.new(0.5, 0.5, 0.5)
+		p.Brightness = 3
+		p.ClockTime = 14.5
+		p.GeographicLatitude = 0
+		p.ExposureCompensation = 0
+		p.EnvironmentDiffuseScale = 1
+		p.EnvironmentSpecularScale = 1
+		p.ColorShift_Top = M.Color3.new(0, 0, 0)
+		p.ColorShift_Bottom = M.Color3.new(0, 0, 0)
+		p.ShadowSoftness = 0.2
+		p.GlobalShadows = true
+		p.FogColor = M.Color3.new(0.75, 0.75, 0.75)
+		p.FogStart = 0
+		p.FogEnd = 100000
+	elseif cls == "ParticleEmitter" then
+		p.Enabled = true
+		p.Rate = 20
 	end
 	return p
 end
@@ -456,6 +527,27 @@ function methods.Clone(self)
 	end
 	return c
 end
+-- Lighting: the sun rises in the east (+X), is highest at noon, a little to the south (+Z)
+function methods.GetSunDirection(self)
+	local a = ((rawget(self, "_props").ClockTime or 14) - 6) / 12 * math.pi
+	return v3(math.cos(a), math.sin(a), 0.35).Unit
+end
+-- Camera: pinhole projection (screen x, y, depth), on screen?
+function methods.WorldToViewportPoint(self, p)
+	local props = rawget(self, "_props")
+	local cf = props.CFrame
+	local rel = p - cf.Position
+	local x, y, z = rel:Dot(cf.RightVector), rel:Dot(cf.UpVector), rel:Dot(cf.LookVector)
+	local vp = props.ViewportSize
+	local f = (vp.Y / 2) / math.tan(math.rad(props.FieldOfView) / 2)
+	if z <= 1e-6 then
+		return v3(vp.X / 2, vp.Y / 2, z), false
+	end
+	local sx, sy = vp.X / 2 + x * f / z, vp.Y / 2 - y * f / z
+	return v3(sx, sy, z), sx >= 0 and sx <= vp.X and sy >= 0 and sy <= vp.Y
+end
+methods.WorldToScreenPoint = methods.WorldToViewportPoint
+
 function methods.GetPlayers(self)
 	return { M.localPlayer }
 end
@@ -471,6 +563,9 @@ function methods.SetAttribute(self, name, value)
 end
 function methods.GetAttributeChangedSignal(self, name)
 	return signal(self, "attr:" .. name)
+end
+function methods.Clear(self)
+	M.cleared = (M.cleared or 0) + 1
 end
 function methods.Emit(self, n)
 	M.emitted = (M.emitted or 0) + n
@@ -512,7 +607,37 @@ localPlayer.Parent = Players
 rawget(Players, "_props").LocalPlayer = localPlayer
 M.sentToServer = {}
 
-local RunService = { Heartbeat = newSignal() }
+-- render-step bindings run before Heartbeat in M.frame, by priority
+local RunService = { Heartbeat = newSignal(), RenderStepped = newSignal() }
+local renderBindings = {}
+function RunService:BindToRenderStep(name, priority, fn)
+	table.insert(renderBindings, { name = name, priority = priority, fn = fn })
+	table.sort(renderBindings, function(a, b)
+		return a.priority < b.priority
+	end)
+end
+function RunService:UnbindFromRenderStep(name)
+	for i = #renderBindings, 1, -1 do
+		if renderBindings[i].name == name then
+			table.remove(renderBindings, i)
+		end
+	end
+end
+M.renderBindings = renderBindings
+
+local Lighting = Instance.new("Lighting")
+Lighting.Name = "Lighting"
+Lighting.Parent = game
+M.Lighting = Lighting
+local terrain = Instance.new("Terrain")
+terrain.Name = "Terrain"
+terrain.Parent = Workspace
+rawget(Workspace, "_props").Terrain = terrain
+rawget(Workspace, "_props").GlobalWind = v3(0, 0, 0)
+local playerGui = Instance.new("PlayerGui")
+playerGui.Name = "PlayerGui"
+playerGui.Parent = localPlayer
+M.playerGui = playerGui
 local tagged = {}
 local tagAdded, tagRemoved = {}, {}
 local CollectionService = {}
@@ -883,6 +1008,7 @@ function M.UserSettings()
 end
 
 local services = {
+	Lighting = Lighting,
 	UserInputService = UserInputService,
 	GuiService = GuiService,
 	ContentProvider = ContentProvider,
@@ -915,6 +1041,10 @@ M.OverlapParams = M.RaycastParams
 -- advances one frame of `dt` seconds
 function M.frame(dt)
 	clock += dt
+	for _, b in table.clone(renderBindings) do
+		b.fn(dt)
+	end
+	RunService.RenderStepped:Fire(dt)
 	RunService.Heartbeat:Fire(dt)
 	local due = {}
 	local keep = {}

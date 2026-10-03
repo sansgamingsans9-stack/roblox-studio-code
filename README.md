@@ -52,7 +52,7 @@ That's it: one folder, no other setup. It contains:
 | `ClientMain` | Script, **RunContext = Client**. Runs on every player's device. |
 | `ServerMain` | Script, **RunContext = Server**. Shares footprints for late joiners. |
 | `Config` | All the settings, documented. Edit this. |
-| `SnowClient`, `SnowField`, `ChunkParts`, `ChunkMesh`, `Quality`, `Shapes`, `StampCodec`, `SnowServer` | The system. |
+| `SnowClient`, `SnowField`, `ChunkParts`, `ChunkMesh`, `Quality`, `SnowWeather`, `WeatherModel`, `Shapes`, `StampCodec`, `SnowServer` | The system. |
 
 > **Publishing:** nothing to do. The default `Parts` renderer uses only normal Parts, so it works
 > in published games without ID verification or any experience setting.
@@ -60,6 +60,46 @@ That's it: one folder, no other setup. It contains:
 Using Rojo instead? `default.project.json` maps `src/DeformableSnow` to
 `ReplicatedStorage.DeformableSnow` (with `emitLegacyScripts: false`, so the `.client`/`.server`
 files become RunContext scripts).
+
+## Snowy weather
+
+Turned on by default (`Config.Weather`). Every player's screen gets:
+
+- **Falling snow in layers.** Ordinary flakes, small fast flakes (short streaks), slow tumbling
+  clumps, a few big soft out-of-focus flakes right in front of the camera, and flakes that glint
+  when the sun is out. They drift with gusty wind and stop falling under roofs.
+- **Fog, clouds and winter light** that follow the weather. Heavier snow brings thicker fog and
+  flat, cool light. Light snow lets the sun break through with soft sun rays, a gentle lens flare,
+  glinting flakes and glittering snow on the ground.
+- **Weather that changes by itself**, slowly drifting between lighter and heavier snowfall around
+  `Weather.Intensity`.
+
+For the best look, set **Lighting → Technology = Future** in Studio (scripts can't change it).
+Your Lighting settings are put back if the weather is stopped. Phones and slow devices get fewer
+flakes and fewer extras (see the quality levels below).
+
+| `Config.Weather` | Default | What it does |
+| --- | --- | --- |
+| `Enabled` | `true` | Turn the whole weather off with `false` |
+| `Intensity` | `0.45` | 0 = a few flakes, 0.5 = steady snowfall, 1 = blizzard |
+| `Variation` / `Period` | `0.35` / `150` | How much and how fast the snowfall changes (0 = constant) |
+| `WindSpeed` / `WindDirection` / `Gusts` | `7` / `30` / `0.6` | Wind in studs/s, direction in degrees, gustiness 0..1 |
+| `ChangeWind` | `true` | Set `Workspace.GlobalWind` |
+| `ChangeLighting` | `true` | Fog, clouds, light and colour grading |
+| `KeepTimeOfDay` | `true` | Don't touch the time of day (set `false` for a low winter sun) |
+| `Fog` / `Clouds` | `true` | |
+| `LensFlares` | `true` | Sun lens flare, sun rays and glinting flakes |
+| `GroundSparkles` | `true` | Sunlit snow glitters |
+| `DepthOfField` | `true` | Very slight blur far away (High quality only) |
+
+**From your own scripts** (a LocalScript), you can force the weather:
+
+```lua
+local SnowWeather = require(game.ReplicatedStorage.DeformableSnow.SnowWeather)
+SnowWeather.pin(1, 0)       -- blizzard
+SnowWeather.pin(0.1, 1)     -- light flurries in sunshine
+SnowWeather.pin(nil, nil)   -- back to the natural weather
+```
 
 ## Renderers
 
@@ -226,7 +266,7 @@ end
 ## Development
 
 - `tools/test.sh` runs the offline test suite with the [`luau`](https://github.com/luau-lang/luau)
-  CLI: 416 checks across 16 suites.
+  CLI: about 10,100 checks across 18 suites (including the weather).
   - Unit tests for the geometry, heightfield and network codec.
   - End-to-end runs of the real client and server code against a small Roblox engine mock
     (`tests/rbxmock.luau`), for both renderers. That includes a game where EditableMesh is blocked

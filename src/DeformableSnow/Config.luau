@@ -93,6 +93,40 @@ local Config = {
 	FootstepSoundId = "",
 	FootstepSoundVolume = 0.35,
 
+	------------------------------------------------------------------ weather
+	-- Snowy weather on every player's screen: falling snow (big and small flakes, some faster
+	-- than others), fog, cold winter light, clouds, gusts of wind, and soft glints and a gentle
+	-- sun lens flare when the sun breaks through. It follows the quality level (lighter on
+	-- phones). For the best look set Lighting.Technology to Future in Studio.
+	Weather = {
+		Enabled = true,
+		-- 0 = a few lonely flakes, 0.5 = steady snowfall, 1 = blizzard. It drifts around this.
+		Intensity = 0.45,
+		-- How much the snowfall changes over time (0 = always the same).
+		Variation = 0.35,
+		-- Seconds for a typical swing between lighter and heavier snow.
+		Period = 150,
+		-- Wind: speed in studs/s, the direction it blows towards in degrees (0 = +X, 90 = +Z),
+		-- and how gusty it is (0..1).
+		WindSpeed = 7,
+		WindDirection = 30,
+		Gusts = 0.6,
+		-- Set Workspace.GlobalWind (flakes, grass and anything else that uses wind).
+		ChangeWind = true,
+		-- Cold winter light, fog, clouds and colour grading. Restored when the weather stops.
+		ChangeLighting = true,
+		-- Leave Lighting.ClockTime alone (keep this on if your game has a day/night cycle).
+		KeepTimeOfDay = true,
+		Fog = true,
+		Clouds = true,
+		-- A soft sun lens flare and glinting flakes when the sun breaks through.
+		LensFlares = true,
+		-- Sunlit snow glitters a little.
+		GroundSparkles = true,
+		-- A very slight blur far away (High quality only).
+		DepthOfField = true,
+	},
+
 	------------------------------------------------------------------ performance
 	-- "Auto": picks a quality level from the device (phone, console, the player's graphics
 	-- setting) and lowers/raises it when the frame rate drops/recovers. Or force one of
