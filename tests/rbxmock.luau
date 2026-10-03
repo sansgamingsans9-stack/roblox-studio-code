@@ -20,8 +20,19 @@ V3mt.__index = function(t, k)
 	elseif k == "Unit" then
 		local m = math.sqrt(t.X * t.X + t.Y * t.Y + t.Z * t.Z)
 		return v3(t.X / m, t.Y / m, t.Z / m)
+	elseif k == "Dot" then
+		return function(a, b)
+			return a.X * b.X + a.Y * b.Y + a.Z * b.Z
+		end
+	elseif k == "Cross" then
+		return function(a, b)
+			return v3(a.Y * b.Z - a.Z * b.Y, a.Z * b.X - a.X * b.Z, a.X * b.Y - a.Y * b.X)
+		end
 	end
 	return nil
+end
+V3mt.__unm = function(a)
+	return v3(-a.X, -a.Y, -a.Z)
 end
 V3mt.__add = function(a, b)
 	return v3(a.X + b.X, a.Y + b.Y, a.Z + b.Z)
@@ -79,6 +90,10 @@ function CFrame.new(x, y, z, ...)
 		return setmetatable({ c = { x, y, z, table.unpack(rest) } }, CFmt)
 	end
 	return setmetatable({ c = { x or 0, y or 0, z or 0, 1, 0, 0, 0, 1, 0, 0, 0, 1 } }, CFmt)
+end
+function CFrame.fromMatrix(pos, vx, vy, vz)
+	vz = vz or vx:Cross(vy)
+	return setmetatable({ c = { pos.X, pos.Y, pos.Z, vx.X, vy.X, vz.X, vx.Y, vy.Y, vz.Y, vx.Z, vy.Z, vz.Z } }, CFmt)
 end
 -- rotation about Y (enough for the tests)
 function CFrame.yaw(x, y, z, a)
@@ -209,7 +224,7 @@ M.newSignal = newSignal
 
 ------------------------------------------------------------------ instances
 local isA = {
-	BasePart = { Part = true, MeshPart = true, BasePart = true },
+	BasePart = { Part = true, MeshPart = true, WedgePart = true, BasePart = true },
 	Part = { Part = true },
 	MeshPart = { MeshPart = true },
 }
@@ -229,7 +244,7 @@ end
 
 local function defaults(cls)
 	local p = { Name = cls, Archivable = true }
-	if cls == "Part" or cls == "MeshPart" then
+	if cls == "Part" or cls == "MeshPart" or cls == "WedgePart" then
 		p.CFrame = CFrame.new()
 		p.Size = v3(4, 1, 2)
 		p.Anchored = false
@@ -930,7 +945,7 @@ function M.snowBoxes()
 	local render = Workspace:FindFirstChild("DeformableSnowRender")
 	if render then
 		for _, p in allDescendants(render, {}) do
-			if p.ClassName == "Part" and p.Name == "Snow" then
+			if (p.ClassName == "Part" or p.ClassName == "WedgePart") and p.Name == "Snow" then
 				table.insert(out, p)
 			end
 		end
@@ -938,10 +953,52 @@ function M.snowBoxes()
 	return out
 end
 
--- top of the snow box covering (x, z), if any
+-- the triangle face of a WedgePart that lies on the snow surface (the higher of its two faces)
+function M.wedgeTop(w)
+	local c, s = w.CFrame.c, w.Size
+	local pos = v3(c[1], c[2], c[3])
+	local X, Y, Z = v3(c[4], c[7], c[10]), v3(c[5], c[8], c[11]), v3(c[6], c[9], c[12])
+	local best, bestY
+	for _, side in { -1, 1 } do
+		local function at(y, z)
+			return pos + X * (side * s.X / 2) + Y * y + Z * z
+		end
+		local a, b, d = at(-s.Y / 2, -s.Z / 2), at(-s.Y / 2, s.Z / 2), at(s.Y / 2, s.Z / 2)
+		local my = (a.Y + b.Y + d.Y) / 3
+		if not bestY or my > bestY then
+			best, bestY = { a, b, d }, my
+		end
+	end
+	return best
+end
+
+-- height of a triangle (a, b, c) above (x, z), or nil when (x, z) is outside it
+function M.triHeight(t, x, z)
+	local a, b, c = t[1], t[2], t[3]
+	local d = (b.Z - c.Z) * (a.X - c.X) + (c.X - b.X) * (a.Z - c.Z)
+	if math.abs(d) < 1e-12 then
+		return nil
+	end
+	local l1 = ((b.Z - c.Z) * (x - c.X) + (c.X - b.X) * (z - c.Z)) / d
+	local l2 = ((c.Z - a.Z) * (x - c.X) + (a.X - c.X) * (z - c.Z)) / d
+	local l3 = 1 - l1 - l2
+	if l1 < -1e-6 or l2 < -1e-6 or l3 < -1e-6 then
+		return nil
+	end
+	return l1 * a.Y + l2 * b.Y + l3 * c.Y
+end
+
+-- top of the drawn snow (boxes and wedge triangles) at (x, z), if any
 function M.boxTopY(x, z)
 	local best
 	for _, p in M.snowBoxes() do
+		if p.ClassName == "WedgePart" then
+			local y = M.triHeight(M.wedgeTop(p), x, z)
+			if y and (not best or y > best) then
+				best = y
+			end
+			continue
+		end
 		local c, s = p.CFrame.Position, p.Size
 		if math.abs(x - c.X) <= s.X / 2 + 1e-9 and math.abs(z - c.Z) <= s.Z / 2 + 1e-9 then
 			local top = c.Y + s.Y / 2
@@ -955,7 +1012,12 @@ end
 
 -- number of pairs of snow boxes that overlap (they must tile without overlapping)
 function M.boxOverlaps()
-	local boxes = M.snowBoxes()
+	local boxes = {}
+	for _, p in M.snowBoxes() do
+		if p.ClassName == "Part" then
+			table.insert(boxes, p)
+		end
+	end
 	local n = 0
 	for a = 1, #boxes do
 		local ca, sa = boxes[a].CFrame.Position, boxes[a].Size

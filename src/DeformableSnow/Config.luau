@@ -17,16 +17,15 @@ local Config = {
 	SnowFolderName = "SnowParts",
 
 	------------------------------------------------------------------ renderer
-	-- "Parts": the snow is drawn with ordinary Parts. Works in every game, no ID verification or
-	--          special setting needed. Prints have crisp, steep walls.
-	-- "EditableMesh": smooth mesh surface. Needs "Enable Mesh / Image APIs" in published games
-	--          (owner must be 13+ and ID verified). Falls back to "Parts" automatically when blocked.
+	-- "Parts": works in every game, no ID verification or special setting needed. Untouched snow
+	--          is drawn with big boxes; footprints and trails become a smooth triangle surface
+	--          made of WedgeParts, so they look like a mesh.
+	-- "EditableMesh": real mesh. Needs "Enable Mesh / Image APIs" in published games (owner must
+	--          be 13+ and ID verified). Falls back to "Parts" automatically when blocked.
 	Renderer = "Parts",
-	-- Parts renderer: pressed snow is rounded to this height step (finer = smoother prints).
-	PartsHeightStep = 0.04,
-	-- Parts renderer: untouched snow is rounded to this coarser step, so slopes and the thinning
-	-- edges become a few wide terraces instead of thousands of tiny boxes.
-	PartsRestHeightStep = 0.2,
+	-- Parts renderer: how closely the triangles follow the snow, in studs. Smaller = smoother
+	-- prints but more Parts. 0.02 .. 0.1
+	PartsSmoothness = 0.03,
 	-- Parts renderer: above this many snow Parts, far snow is drawn with less detail.
 	MaxSnowParts = 12000,
 
@@ -34,9 +33,10 @@ local Config = {
 	-- Studs of soft snow laid on top of each snow part. Characters standing on a collidable part
 	-- sink into this layer; on non-collidable parts they wade through to whatever is below.
 	SnowDepth = 1.0,
-	-- Grid spacing in studs. Smaller = sharper footprints but more memory/CPU. (0.2 .. 1)
-	CellSize = 0.25,
-	-- Snow thins out over this many studs at the edges of the snow area.
+	-- Grid spacing in studs. Smaller = sharper footprints but more Parts/memory. (0.25 .. 1)
+	CellSize = 0.4,
+	-- EditableMesh renderer: snow thins out over this many studs at the edges of the snow area.
+	-- (The Parts renderer always draws clean, straight edges.)
 	EdgeFalloff = 1.5,
 	-- Surfaces steeper than this (degrees) do not hold snow.
 	MaxSlopeAngle = 60,
@@ -51,6 +51,7 @@ local Config = {
 	Material = Enum.Material.Snow,
 	-- Optional MaterialVariant name (from MaterialService) for a custom snow texture.
 	MaterialVariant = "",
+	-- EditableMesh renderer only: size of one texture repeat.
 	TextureStudsPerTile = 8,
 	CastShadow = true,
 
@@ -93,11 +94,11 @@ local Config = {
 	FootstepSoundVolume = 0.35,
 
 	------------------------------------------------------------------ performance
-	-- Columns per chunk side (multiple of 8, max 64).
+	-- Columns per chunk side: 16, 32 or 64.
 	ChunkCells = 64,
 	-- Level of detail: full detail closer than [1], 1/2 closer than [2], 1/4 closer than [3],
-	-- 1/8 beyond that.
-	LodDistances = { 64, 128, 256 },
+	-- 1/8 beyond that. (Footprints far away need far fewer Parts at lower detail.)
+	LodDistances = { 32, 64, 128 },
 	-- Snow farther than this from the camera is not drawn (the plain parts show instead).
 	MaxRenderDistance = 512,
 	-- Prints are only simulated within this distance of the camera.

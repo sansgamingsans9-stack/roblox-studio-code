@@ -3,9 +3,10 @@
 Real, deformable snow for Roblox Studio. Everything inside **`Workspace.SnowParts`** gets a layer of
 soft snow on top. Anything that walks, rolls or drives through it presses it down.
 
-**No ID verification needed.** By default the snow is drawn with ordinary Parts, so it works in
-every published game with no special settings. (A smoother `EditableMesh` renderer is optional,
-see [Renderers](#renderers).)
+**No ID verification needed.** By default the snow is drawn with ordinary Parts and WedgeParts,
+so it works in every published game with no special settings. Footprints are a real, smooth
+triangle surface (like a mesh), not pixels. (An `EditableMesh` renderer is optional, see
+[Renderers](#renderers).)
 
 - **Any part type.** Part, MeshPart, Union, Wedge, Cylinder, Ball, inside Models or Folders at any depth.
 - **Collidable or not.**
@@ -27,7 +28,8 @@ see [Renderers](#renderers).)
   trails (the server keeps a short history).
 - **Fast.** The world is split into chunks with 4 levels of detail and loaded in the background
   within a per-frame time budget. Flat untouched snow is merged into big boxes (an untouched
-  16×16-stud chunk is one Part), and only the boxes that actually change are updated.
+  25×25-stud chunk is one Part), footprints use as few triangles as their shape needs, and only
+  the Parts that actually change are updated.
 
 ## Install (2 minutes)
 
@@ -57,7 +59,7 @@ files become RunContext scripts).
 
 | `Config.Renderer` | Looks | Needs |
 | --- | --- | --- |
-| `"Parts"` (default) | Snow made of merged boxes; prints have crisp, steep walls and flat floors. Slopes look terraced. | Nothing. Works everywhere. |
+| `"Parts"` (default) | Untouched snow is big flat boxes; footprints, trails, rims and slopes are a smooth triangle surface built from WedgeParts (flat-shaded, like a low-poly mesh). Snow edges are clean, straight slabs. | Nothing. Works everywhere. |
 | `"EditableMesh"` | Smooth mesh surface with smooth slopes. | In published games, an owner who is 13+ and ID-verified, with **"Enable Mesh / Image APIs"** turned on in the Creator Dashboard. If it's blocked, the system switches to `"Parts"` by itself and prints one warning. |
 
 ## Settings (`Config`)
@@ -66,12 +68,11 @@ files become RunContext scripts).
 | --- | --- | --- |
 | `SnowFolderName` | `"SnowParts"` | Folder in Workspace that holds the snow parts |
 | `Renderer` | `"Parts"` | `"Parts"` or `"EditableMesh"` (see [Renderers](#renderers)) |
-| `PartsHeightStep` | `0.04` | Parts renderer: pressed snow is rounded to this height step |
-| `PartsRestHeightStep` | `0.2` | Parts renderer: untouched snow is rounded to this coarser step, so slopes become a few wide terraces |
+| `PartsSmoothness` | `0.03` | Parts renderer: how closely the triangles follow the snow, in studs (smaller = smoother, more Parts) |
 | `MaxSnowParts` | `12000` | Parts renderer: above this many snow Parts, far snow gets less detail (snow within 16 studs of the camera is never reduced) |
 | `SnowDepth` | `1.0` | Studs of snow on top of each part |
-| `CellSize` | `0.25` | Grid spacing. Smaller means sharper prints but more Parts/memory. `0.2`–`1` |
-| `EdgeFalloff` | `1.5` | Snow thins out over this distance at the edges |
+| `CellSize` | `0.4` | Grid spacing. Smaller means sharper prints but more Parts/memory. `0.25`–`1` |
+| `EdgeFalloff` | `1.5` | EditableMesh renderer: snow thins out over this distance at the edges (Parts: straight edges) |
 | `MaxSlopeAngle` | `60` | Steeper surfaces hold no snow |
 | `CliffHeight` | `3` | Bigger height jumps are treated as edges (snow doesn't drape off roofs) |
 | `SnowColor` / `PackedSnowTint` | white / blue-grey | Fresh colour, and the tint where snow is pressed |
@@ -84,7 +85,7 @@ files become RunContext scripts).
 | `SlowdownInDeepSnow` / `SlowdownStrength` | `true` / `0.3` | Up to 30% slower in fresh deep snow |
 | `FootstepParticles` | `true` | Snow puffs |
 | `FootstepSoundId` | `""` | e.g. `"rbxassetid://…"` for a crunch sound |
-| `LodDistances` | `{64, 128, 256}` | Full / half / quarter detail ranges (eighth detail beyond) |
+| `LodDistances` | `{32, 64, 128}` | Full / half / quarter detail ranges (eighth detail beyond) |
 | `MaxRenderDistance` | `512` | Snow farther away than this isn't drawn |
 | `SimulationDistance` | `300` | Prints are simulated within this range of the camera |
 | `FrameBudgetMs` | `3` | Background loading time per frame |
@@ -114,17 +115,19 @@ files become RunContext scripts).
    that vertical line and pushes the snow down to there (never below the ground). A rim is pushed up
    around the print.
 4. **Drawing.** Each 16×16-stud chunk is drawn by one of two renderers:
-   - **Parts** (default): every snow sample is a square cell. Neighbouring cells at the same
-     height and tint merge into one box (greedy meshing), per 4×4-stud tile.
-     - A tile is rebuilt only when one of its cells visibly changes (cached per cell), unchanged
-       boxes are never written to, moved boxes go through `Workspace:BulkMoveTo`, and Parts are
-       pooled and reused.
-     - Chunks at every detail level cover exactly their own area: no gaps, no overlaps. Boxes reach
-       down to their lowest neighbour, so slopes have no gaps either.
-     - Snow tops never sit on a part's surface, and box sides are nudged off part edges, so
-       nothing z-fights.
-     - Tiles that would need too many boxes (steep, diagonal or curved snow) use taller terraces
-       and then merge untouched snow in bigger blocks. Prints keep full detail.
+   - **Parts** (default): each chunk is split into 16×16-cell tiles.
+     - A tile of level, untouched snow is drawn with boxes, merged as much as possible (a whole
+       untouched chunk is one Part).
+     - Any other tile (footprints, trails, rims, slopes) is triangulated with a right-triangulated
+       irregular network (RTIN, the "Martini" algorithm): big triangles where the snow is flat,
+       small ones only where the shape needs them, never more than `PartsSmoothness` studs off.
+       Every triangle is drawn with two WedgeParts whose top faces sit exactly on it; their
+       thickness hangs below the surface and hides hairline cracks between tiles.
+     - A tile is rebuilt only when one of its samples visibly changes (cached per sample),
+       triangles and boxes that did not change are never written to, moved Parts go through
+       `Workspace:BulkMoveTo`, and Parts are pooled and reused.
+     - Chunks at every detail level cover exactly their own area, and box sides are nudged off
+       part edges, so nothing z-fights.
    - **EditableMesh**: one mesh per chunk shown through `AssetService:CreateMeshPartAsync`. Normals
      come from the heightfield (seamless shading), thin "skirts" hide cracks between detail levels,
      and two sub-pixel triangles pin each mesh's bounding box so it never shifts while it deforms.
@@ -142,12 +145,12 @@ files become RunContext scripts).
 - Snow parts are meant to be mostly static. Moving or resizing one works, but the snow around it is
   re-read.
 - MeshPart wheels are treated as boxes. Use Part cylinders for perfect ruts.
-- Parts renderer: snow on slopes and curved parts looks terraced (stair-stepped), and steep or
-  diagonal hills get coarser steps to keep the Part count down (at most about 570 Parts per
-  16×16-stud chunk; flat snow is 1 Part per chunk). Prints have pixel-stepped outlines at
-  `CellSize` resolution. Lower `CellSize` for finer prints (more Parts).
+- Parts renderer: triangles are flat-shaded (like a low-poly mesh), and the snow ends in a clean
+  vertical edge at the sides of your parts instead of thinning out. A footprint costs about 90
+  WedgeParts at full detail (far fewer farther away); a player walking around keeps roughly
+  4,000–5,000 snow Parts alive. Raise `CellSize` or `PartsSmoothness` for fewer Parts.
 - Parts renderer: Roblox maps the Snow material per Part with a random offset, so you may see
-  faint texture seams between boxes. `Material = Enum.Material.SmoothPlastic` is perfectly
+  faint texture seams between triangles. `Material = Enum.Material.SmoothPlastic` is perfectly
   seamless.
 - EditableMesh renderer: on low-memory devices Roblox may refuse more editable meshes. The affected
   chunks are then drawn with Parts instead, and a warning is printed once.
@@ -155,14 +158,15 @@ files become RunContext scripts).
 ## Development
 
 - `tools/test.sh` runs the offline test suite with the [`luau`](https://github.com/luau-lang/luau)
-  CLI: 214 checks across 10 suites.
+  CLI: 210 checks across 10 suites.
   - Unit tests for the geometry, heightfield and network codec.
   - End-to-end runs of the real client and server code against a small Roblox engine mock
     (`tests/rbxmock.luau`), for both renderers. That includes a game where EditableMesh is blocked
     (automatic switch to Parts), running out of EditableMesh memory, the Parts budget, and the
-    Parts geometry (tiling at every detail level, no gaps or z-fighting on slopes, bounded Part
-    counts on diagonal slopes, no updates for invisible changes). The mock's `EditableMesh`
-    rejects invalid or mixed-up ids like the real one.
+    Parts geometry: the two-wedge triangle construction, surfaces that follow slopes, curves
+    and footprints within the smoothness tolerance with no holes, flat snow as single Parts,
+    and no updates for invisible changes. The mock's `EditableMesh` rejects invalid or mixed-up
+    ids like the real one.
 
   ```sh
   LUAU=/path/to/luau tools/test.sh

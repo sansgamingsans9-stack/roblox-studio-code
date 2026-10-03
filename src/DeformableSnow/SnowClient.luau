@@ -94,7 +94,8 @@ local SnowClient = {}
 
 ------------------------------------------------------------------------ settings
 local CELL = math.clamp(Config.CellSize, 0.1, 4)
-local CHUNK_CELLS = math.clamp((Config.ChunkCells // 8) * 8, 8, 64)
+-- a power of two (16, 32 or 64): the Parts renderer triangulates 16x16-cell tiles
+local CHUNK_CELLS = if Config.ChunkCells >= 64 then 64 elseif Config.ChunkCells >= 32 then 32 else 16
 local CHUNK_SPAN = CELL * CHUNK_CELLS
 local LOD1 = Config.LodDistances[1] or 64
 local LOD2 = Config.LodDistances[2] or 128
@@ -1411,7 +1412,9 @@ function SnowClient.start()
 	field = SnowField.new({
 		cellSize = CELL,
 		chunkCells = CHUNK_CELLS,
-		edgeFalloff = math.max(0, Config.EdgeFalloff),
+		-- the Parts renderer draws clean, straight snow edges; thinning them out (smoothly, with
+		-- triangles) would cost far too many Parts along every edge
+		edgeFalloff = if useParts then 0 else math.max(0, Config.EdgeFalloff),
 		minThickness = math.max(0.01, Config.MinThickness),
 		cliffHeight = math.max(0.5, Config.CliffHeight),
 		maxSlopeCos = math.cos(math.rad(math.clamp(Config.MaxSlopeAngle, 1, 89))),
@@ -1433,8 +1436,7 @@ function SnowClient.start()
 		material = Config.Material,
 		materialVariant = Config.MaterialVariant,
 		studsPerTile = math.max(0.5, Config.TextureStudsPerTile),
-		heightStep = math.max(0.005, Config.PartsHeightStep),
-		restHeightStep = math.max(0.005, Config.PartsRestHeightStep),
+		smoothness = math.max(0.005, Config.PartsSmoothness),
 		castShadow = Config.CastShadow,
 		parent = renderFolder,
 	}

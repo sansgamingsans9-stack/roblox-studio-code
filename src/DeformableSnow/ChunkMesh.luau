@@ -31,7 +31,7 @@ export type Style = {
 	studsPerTile: number,
 	castShadow: boolean,
 	parent: Instance,
-	heightStep: number,
+	smoothness: number,
 }
 
 export type ChunkMesh = typeof(setmetatable(
