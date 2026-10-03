@@ -1,0 +1,3703 @@
+<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4">
+	<Item class="Folder" referent="RBXE8C61213DC63449E86C0C9590F469B3D">
+		<Properties>
+			<string name="Name">DeformableSnow</string>
+		</Properties>
+		<Item class="ModuleScript" referent="RBX4520CF3D1374492289CB49435035E6E8">
+			<Properties>
+				<string name="Name">Config</string>
+				<ProtectedString name="Source"><![CDATA[--!strict
+--[[
+	DeformableSnow - settings
+	Edit anything here. Everything inside Workspace.<SnowFolderName> (Parts, MeshParts, Unions,
+	Wedges... collidable or not, nested in Models/Folders or not) gets a layer of soft snow on top
+	that anything walking/rolling/driving through it presses down.
+
+	Per-part overrides (set as Attributes on the part in the Properties window):
+	  SnowDepth  (number)  snow thickness on that part; 0 = no snow on it
+	Tags (CollectionService / Properties > Tags):
+	  SnowDeformer  on any part/model: always makes prints (even anchored, e.g. a moving plow)
+	  SnowIgnore    on any part/model: never makes prints; inside the snow folder: gets no snow
+]]
+
+local Config = {
+	-- Folder in Workspace that holds the snow parts.
+	SnowFolderName = "SnowParts",
+
+	------------------------------------------------------------------ look
+	-- Studs of soft snow laid on top of each snow part. Characters standing on a collidable part
+	-- sink into this layer; on non-collidable parts they wade through to whatever is below.
+	SnowDepth = 1.0,
+	-- Grid spacing in studs. Smaller = sharper footprints but more memory/CPU. (0.25 .. 1)
+	CellSize = 0.5,
+	-- Snow thins out over this many studs at the edges of the snow area.
+	EdgeFalloff = 1.5,
+	-- Surfaces steeper than this (degrees) do not hold snow.
+	MaxSlopeAngle = 60,
+	-- Height jumps bigger than this between neighbouring spots are treated as an edge
+	-- (so snow on a roof does not drape down to the ground).
+	CliffHeight = 3,
+	-- Pressed snow never gets thinner than this (stops it flickering with the part below).
+	MinThickness = 0.06,
+	SnowColor = Color3.fromRGB(242, 246, 252),
+	-- Multiplied in where the snow is packed down (slightly blue/grey, like real footprints).
+	PackedSnowTint = Color3.fromRGB(196, 210, 232),
+	Material = Enum.Material.Snow,
+	-- Optional MaterialVariant name (from MaterialService) for a custom snow texture.
+	MaterialVariant = "",
+	TextureStudsPerTile = 8,
+	CastShadow = true,
+
+	-- Non-collidable snow parts: players wade through them down to whatever is underneath.
+	-- If there is NOTHING solid underneath, you would fall through, so:
+	--   "Auto" = add an invisible local collider only for parts with nothing solid below them
+	--   true   = always make non-collidable snow parts walkable
+	--   false  = never (leave collisions exactly as you set them)
+	WalkOnNonCollidableSnow = "Auto" :: boolean | string,
+
+	------------------------------------------------------------------ deformation
+	-- Snow pushed up around prints, as a fraction of how deep the print is.
+	RimRatio = 0.22,
+	-- How far (studs) from the print that lip reaches.
+	RimWidth = 0.6,
+	-- Seconds a print stays untouched before it starts to fill back in.
+	RegrowDelay = 20,
+	-- Studs per second that prints fill back in. 0 = prints stay forever.
+	RegrowSpeed = 0.015,
+
+	------------------------------------------------------------------ what makes prints
+	-- Players and NPCs (anything with a Humanoid).
+	DeformByCharacters = true,
+	-- Unanchored parts touching the snow: balls, crates, vehicle wheels, dropped tools...
+	DeformByUnanchoredParts = true,
+	-- Unanchored parts bigger than this (studs, largest side) are ignored.
+	MaxDeformerSize = 24,
+	DeformerTag = "SnowDeformer",
+	IgnoreTag = "SnowIgnore",
+
+	------------------------------------------------------------------ gameplay & feel
+	-- Wading through deep, fresh snow slows the local player down (walking in an existing trail
+	-- does not). Works together with other scripts that change WalkSpeed (sprint etc.).
+	SlowdownInDeepSnow = true,
+	SlowdownStrength = 0.3, -- 0.3 = up to 30% slower
+	-- Little puffs of snow when a foot sinks into fresh snow.
+	FootstepParticles = true,
+	-- Optional crunch sound, e.g. "rbxassetid://1234567890". Empty = off.
+	FootstepSoundId = "",
+	FootstepSoundVolume = 0.35,
+
+	------------------------------------------------------------------ performance
+	-- Columns per chunk side (multiple of 8, max 64).
+	ChunkCells = 64,
+	-- Level of detail: full detail closer than [1], 1/2 closer than [2], 1/4 closer than [3],
+	-- 1/8 beyond that.
+	LodDistances = { 64, 128, 256 },
+	-- Snow farther than this from the camera is not drawn (the plain parts show instead).
+	MaxRenderDistance = 512,
+	-- Prints are only simulated within this distance of the camera.
+	SimulationDistance = 300,
+	-- Milliseconds per frame the background loader (sampling + meshing) may use.
+	FrameBudgetMs = 3,
+
+	------------------------------------------------------------------ multiplayer
+	-- Share prints through the server so players who join later (or are far away) still see the
+	-- trails. Needs the server script (ServerMain) to be running.
+	SyncFootprints = true,
+	-- Maximum number of prints the server remembers for late joiners.
+	MaxHistory = 6000,
+
+	-- Prints chunk/mesh statistics to the output every few seconds.
+	Debug = false,
+}
+
+return Config
+]]></ProtectedString>
+			</Properties>
+		</Item>
+		<Item class="ModuleScript" referent="RBX1DD536AA5C454703883854B9B59944F8">
+			<Properties>
+				<string name="Name">Shapes</string>
+				<ProtectedString name="Source"><![CDATA[--!strict
+--[[
+	Shapes
+	Pure geometry for anything that can press into the snow (feet, balls, wheels, crates...).
+	No Roblox APIs are used here so the math can be unit-tested with the plain `luau` CLI.
+
+	A shape is an oriented box, a ball or a cylinder (Roblox cylinders run along their local X axis).
+	For every snow column we ask one question: "what is the lowest point of this shape on the
+	vertical line through (x, z)?" - that is exactly how deep the snow gets pushed.
+]]
+
+local Shapes = {}
+
+Shapes.BOX = 1
+Shapes.BALL = 2
+Shapes.CYLINDER = 3
+
+export type Shape = {
+	kind: number,
+	px: number,
+	py: number,
+	pz: number,
+	-- rotation matrix, same layout as CFrame:GetComponents() (columns are the local axes)
+	r00: number,
+	r01: number,
+	r02: number,
+	r10: number,
+	r11: number,
+	r12: number,
+	r20: number,
+	r21: number,
+	r22: number,
+	-- half size along local X/Y/Z
+	hx: number,
+	hy: number,
+	hz: number,
+	radius: number,
+	-- world-space bounding box
+	minX: number,
+	maxX: number,
+	minY: number,
+	maxY: number,
+	minZ: number,
+	maxZ: number,
+	-- horizontal footprint rectangle (centered on px/pz), used for the raised rim around prints
+	ux: number,
+	uz: number,
+	hu: number,
+	hv: number,
+}
+
+local abs = math.abs
+local sqrt = math.sqrt
+local huge = math.huge
+
+function Shapes.new(): Shape
+	return {
+		kind = Shapes.BOX,
+		px = 0,
+		py = 0,
+		pz = 0,
+		r00 = 1,
+		r01 = 0,
+		r02 = 0,
+		r10 = 0,
+		r11 = 1,
+		r12 = 0,
+		r20 = 0,
+		r21 = 0,
+		r22 = 1,
+		hx = 0.5,
+		hy = 0.5,
+		hz = 0.5,
+		radius = 0.5,
+		minX = -0.5,
+		maxX = 0.5,
+		minY = -0.5,
+		maxY = 0.5,
+		minZ = -0.5,
+		maxZ = 0.5,
+		ux = 1,
+		uz = 0,
+		hu = 0.5,
+		hv = 0.5,
+	}
+end
+
+-- Fills `s` in place (no allocations - this runs for every deformer every frame).
+function Shapes.set(
+	s: Shape,
+	kind: number,
+	px: number,
+	py: number,
+	pz: number,
+	r00: number,
+	r01: number,
+	r02: number,
+	r10: number,
+	r11: number,
+	r12: number,
+	r20: number,
+	r21: number,
+	r22: number,
+	sx: number,
+	sy: number,
+	sz: number
+): Shape
+	s.kind = kind
+	s.px, s.py, s.pz = px, py, pz
+	s.r00, s.r01, s.r02 = r00, r01, r02
+	s.r10, s.r11, s.r12 = r10, r11, r12
+	s.r20, s.r21, s.r22 = r20, r21, r22
+
+	local hx, hy, hz = sx * 0.5, sy * 0.5, sz * 0.5
+
+	if kind == Shapes.BALL then
+		local r = math.min(hx, hy, hz)
+		s.hx, s.hy, s.hz, s.radius = r, r, r, r
+		s.minX, s.maxX = px - r, px + r
+		s.minY, s.maxY = py - r, py + r
+		s.minZ, s.maxZ = pz - r, pz + r
+		s.ux, s.uz, s.hu, s.hv = 1, 0, r, r
+		return s
+	end
+
+	local ex, ey, ez
+	if kind == Shapes.CYLINDER then
+		-- axis = local X, radius from the other two axes (Roblox behaviour)
+		local r = math.min(hy, hz)
+		hy, hz = r, r
+		s.radius = r
+		-- exact AABB of a finite cylinder
+		ex = abs(r00) * hx + r * sqrt(math.max(0, 1 - r00 * r00))
+		ey = abs(r10) * hx + r * sqrt(math.max(0, 1 - r10 * r10))
+		ez = abs(r20) * hx + r * sqrt(math.max(0, 1 - r20 * r20))
+	else
+		s.radius = math.min(hx, hy, hz)
+		ex = abs(r00) * hx + abs(r01) * hy + abs(r02) * hz
+		ey = abs(r10) * hx + abs(r11) * hy + abs(r12) * hz
+		ez = abs(r20) * hx + abs(r21) * hy + abs(r22) * hz
+	end
+	s.hx, s.hy, s.hz = hx, hy, hz
+	s.minX, s.maxX = px - ex, px + ex
+	s.minY, s.maxY = py - ey, py + ey
+	s.minZ, s.maxZ = pz - ez, pz + ez
+
+	-- Footprint: take the local axis that is the most horizontal-looking (least vertical) as the
+	-- rectangle's main direction, then measure the box's projected half-widths along it and its
+	-- perpendicular (support function of the projected box).
+	local a0, a1, a2 = abs(r10), abs(r11), abs(r12) -- vertical component of each local axis
+	local fx, fz
+	if a0 <= a1 and a0 <= a2 then
+		fx, fz = r00, r20
+	elseif a2 <= a1 then
+		fx, fz = r02, r22
+	else
+		fx, fz = r01, r21
+	end
+	local len = sqrt(fx * fx + fz * fz)
+	if len < 1e-6 then
+		fx, fz, len = 1, 0, 1
+	end
+	local ux, uz = fx / len, fz / len
+	local vx, vz = -uz, ux
+	s.ux, s.uz = ux, uz
+	s.hu = hx * abs(r00 * ux + r20 * uz) + hy * abs(r01 * ux + r21 * uz) + hz * abs(r02 * ux + r22 * uz)
+	s.hv = hx * abs(r00 * vx + r20 * vz) + hy * abs(r01 * vx + r21 * vz) + hz * abs(r02 * vx + r22 * vz)
+	return s
+end
+
+--[[
+	Lowest point of the shape on the vertical line through (x, z), or nil when the line misses it.
+]]
+function Shapes.lowestAt(s: Shape, x: number, z: number): number?
+	local dx, dz = x - s.px, z - s.pz
+	local kind = s.kind
+
+	if kind == Shapes.BALL then
+		local r = s.radius
+		local d2 = dx * dx + dz * dz
+		local r2 = r * r
+		if d2 > r2 then
+			return nil
+		end
+		return s.py - sqrt(r2 - d2)
+	end
+
+	-- Line in the shape's local space: L(t) = a + t * d, where t is world Y relative to s.py.
+	local a0 = s.r00 * dx + s.r20 * dz
+	local a1 = s.r01 * dx + s.r21 * dz
+	local a2 = s.r02 * dx + s.r22 * dz
+	local d0, d1, d2 = s.r10, s.r11, s.r12
+
+	local tmin, tmax = -huge, huge
+
+	if kind == Shapes.CYLINDER then
+		-- axial slab (local X)
+		local h = s.hx
+		if abs(d0) < 1e-9 then
+			if abs(a0) > h then
+				return nil
+			end
+		else
+			local t1, t2 = (-h - a0) / d0, (h - a0) / d0
+			if t1 > t2 then
+				t1, t2 = t2, t1
+			end
+			tmin, tmax = t1, t2
+		end
+		-- radial: (a1 + t d1)^2 + (a2 + t d2)^2 <= r^2
+		local r = s.radius
+		local A = d1 * d1 + d2 * d2
+		local C = a1 * a1 + a2 * a2 - r * r
+		if A < 1e-12 then
+			if C > 0 then
+				return nil
+			end
+		else
+			local B = 2 * (a1 * d1 + a2 * d2)
+			local disc = B * B - 4 * A * C
+			if disc < 0 then
+				return nil
+			end
+			local sq = sqrt(disc)
+			local t1, t2 = (-B - sq) / (2 * A), (-B + sq) / (2 * A)
+			if t1 > tmin then
+				tmin = t1
+			end
+			if t2 < tmax then
+				tmax = t2
+			end
+		end
+		if tmin > tmax then
+			return nil
+		end
+		return s.py + tmin
+	end
+
+	-- oriented box: slab test on all three axes
+	local h = s.hx
+	if abs(d0) < 1e-9 then
+		if abs(a0) > h then
+			return nil
+		end
+	else
+		local t1, t2 = (-h - a0) / d0, (h - a0) / d0
+		if t1 > t2 then
+			t1, t2 = t2, t1
+		end
+		if t1 > tmin then
+			tmin = t1
+		end
+		if t2 < tmax then
+			tmax = t2
+		end
+	end
+	h = s.hy
+	if abs(d1) < 1e-9 then
+		if abs(a1) > h then
+			return nil
+		end
+	else
+		local t1, t2 = (-h - a1) / d1, (h - a1) / d1
+		if t1 > t2 then
+			t1, t2 = t2, t1
+		end
+		if t1 > tmin then
+			tmin = t1
+		end
+		if t2 < tmax then
+			tmax = t2
+		end
+	end
+	h = s.hz
+	if abs(d2) < 1e-9 then
+		if abs(a2) > h then
+			return nil
+		end
+	else
+		local t1, t2 = (-h - a2) / d2, (h - a2) / d2
+		if t1 > t2 then
+			t1, t2 = t2, t1
+		end
+		if t1 > tmin then
+			tmin = t1
+		end
+		if t2 < tmax then
+			tmax = t2
+		end
+	end
+	if tmin > tmax then
+		return nil
+	end
+	return s.py + tmin
+end
+
+--[[
+	Approximate horizontal distance from (x, z) to the shape's footprint.
+	<= 0 means inside the footprint. Used to shape the little lip of snow pushed up around prints.
+]]
+function Shapes.footprintDistance(s: Shape, x: number, z: number): number
+	local dx, dz = x - s.px, z - s.pz
+	if s.kind == Shapes.BALL then
+		return sqrt(dx * dx + dz * dz) - s.radius
+	end
+	local ux, uz = s.ux, s.uz
+	local qu = abs(dx * ux + dz * uz) - s.hu
+	local qv = abs(dz * ux - dx * uz) - s.hv
+	local ou, ov = math.max(qu, 0), math.max(qv, 0)
+	return sqrt(ou * ou + ov * ov) + math.min(math.max(qu, qv), 0)
+end
+
+return Shapes
+]]></ProtectedString>
+			</Properties>
+		</Item>
+		<Item class="ModuleScript" referent="RBXEB64436EEC0443E983E421025AAF0BFC">
+			<Properties>
+				<string name="Name">SnowField</string>
+				<ProtectedString name="Source"><![CDATA[--!strict
+--[[
+	SnowField
+	The snow simulation itself: a sparse, chunked, world-aligned heightfield.
+
+	* Columns sit on a global grid (column gx is at world X = gx * CellSize).
+	* A chunk owns columns [cx*C, cx*C + C] on each axis (the last row/column is shared with the
+	  next chunk so every chunk can be meshed on its own).
+	* Each column stores:
+	    base - the top of the snow part under it (the "ground")
+	    rest - where the untouched snow surface is (base + snow depth, thinned near edges/slopes)
+	    cur  - where the snow surface is right now (pushed down by feet, pushed up into rims)
+	    hit  - last time something pressed on it (snow only regrows after RegrowDelay)
+
+	No Roblox APIs are used here: surface sampling is injected as a function so this module can be
+	unit-tested with the plain `luau` CLI.
+]]
+
+local Shapes = require(script.Parent.Shapes)
+
+type Shape = Shapes.Shape
+
+local readf32 = buffer.readf32
+local writef32 = buffer.writef32
+local lowestAt = Shapes.lowestAt
+local footprintDistance = Shapes.footprintDistance
+
+local NO_SNOW = -1e30
+local NO_SNOW_LIMIT = -1e29
+local EPS = 1e-3
+local CONTACT_EPS = 0.05
+local INF = 1e9
+local SQRT2 = math.sqrt(2)
+
+local SnowField = {}
+SnowField.__index = SnowField
+
+SnowField.NO_SNOW = NO_SNOW
+SnowField.NO_SNOW_LIMIT = NO_SNOW_LIMIT
+
+export type Params = {
+	cellSize: number,
+	chunkCells: number,
+	edgeFalloff: number,
+	minThickness: number,
+	cliffHeight: number,
+	maxSlopeCos: number,
+	rimRatio: number,
+	rimWidth: number,
+	regrowDelay: number,
+	regrowSpeed: number,
+	maxPendingPerChunk: number,
+}
+
+-- (x, z) -> surfaceY (nil = no snow part here), surface normal Y, snow depth for that part
+export type Sampler = (x: number, z: number) -> (number?, number, number)
+
+export type Grid = {
+	step: number,
+	n: number,
+	base: buffer,
+	rest: buffer,
+	minY: number,
+	maxY: number,
+	snowCount: number,
+}
+
+export type Full = {
+	step: number,
+	n: number,
+	base: buffer,
+	rest: buffer,
+	cur: buffer,
+	hit: buffer,
+	minY: number,
+	maxY: number,
+	snowCount: number,
+	active: { [number]: boolean },
+	activeCount: number,
+	lastRegrow: number,
+}
+
+export type Pending = {
+	shape: Shape,
+	hitTime: number,
+}
+
+export type Chunk = {
+	cx: number,
+	cz: number,
+	key: number,
+	refs: number,
+	full: Full?,
+	coarse: { [number]: Grid },
+	gridVersion: number,
+	dirty: { [number]: number },
+	dirtyCount: number,
+	version: number,
+	stale: boolean,
+	pending: { Pending }?,
+	lastNeeded: number,
+	render: any,
+}
+
+export type Stats = {
+	volume: number,
+	maxPen: number,
+	sumX: number,
+	sumY: number,
+	sumZ: number,
+	count: number,
+}
+
+export type SnowField = typeof(setmetatable(
+	{} :: {
+		params: Params,
+		chunks: { [number]: Chunk },
+		chunkCount: number,
+	},
+	SnowField
+))
+
+local function smoothstep(e0: number, e1: number, x: number): number
+	if e1 <= e0 then
+		return if x >= e0 then 1 else 0
+	end
+	local t = (x - e0) / (e1 - e0)
+	if t <= 0 then
+		return 0
+	elseif t >= 1 then
+		return 1
+	end
+	return t * t * (3 - 2 * t)
+end
+SnowField.smoothstep = smoothstep
+
+function SnowField.chunkKey(cx: number, cz: number): number
+	return (cx + 32768) * 65536 + (cz + 32768)
+end
+
+function SnowField.newStats(): Stats
+	return { volume = 0, maxPen = 0, sumX = 0, sumY = 0, sumZ = 0, count = 0 }
+end
+
+function SnowField.resetStats(st: Stats)
+	st.volume, st.maxPen, st.sumX, st.sumY, st.sumZ, st.count = 0, 0, 0, 0, 0, 0
+end
+
+function SnowField.new(params: Params): SnowField
+	assert(params.chunkCells % 8 == 0, "ChunkCells must be a multiple of 8")
+	local self = setmetatable({
+		params = params,
+		chunks = {},
+		chunkCount = 0,
+	}, SnowField)
+	return self
+end
+
+-- Chunk index range [c0, c1] whose columns touch the world interval [a, b].
+function SnowField.chunkRange(self: SnowField, a: number, b: number): (number, number)
+	local span = self.params.chunkCells * self.params.cellSize
+	return math.ceil(a / span) - 1, math.floor(b / span)
+end
+
+function SnowField.getChunk(self: SnowField, cx: number, cz: number): Chunk?
+	return self.chunks[SnowField.chunkKey(cx, cz)]
+end
+
+-- World-space centre (x, z) of a chunk.
+function SnowField.chunkCenter(self: SnowField, chunk: Chunk): (number, number)
+	local p = self.params
+	local half = p.chunkCells * 0.5
+	return (chunk.cx * p.chunkCells + half) * p.cellSize, (chunk.cz * p.chunkCells + half) * p.cellSize
+end
+
+--[[
+	Region bookkeeping: each snow part references the chunks under its bounding box.
+	Returns the keys so the caller can release them later.
+]]
+function SnowField.addRegion(self: SnowField, minX: number, maxX: number, minZ: number, maxZ: number): { number }
+	local keys = {}
+	local cx0, cx1 = self:chunkRange(minX, maxX)
+	local cz0, cz1 = self:chunkRange(minZ, maxZ)
+	for cz = cz0, cz1 do
+		for cx = cx0, cx1 do
+			local key = SnowField.chunkKey(cx, cz)
+			local chunk = self.chunks[key]
+			if not chunk then
+				chunk = {
+					cx = cx,
+					cz = cz,
+					key = key,
+					refs = 0,
+					full = nil,
+					coarse = {},
+					gridVersion = 0,
+					dirty = {},
+					dirtyCount = 0,
+					version = 0,
+					stale = false,
+					pending = nil,
+					lastNeeded = -math.huge,
+					render = nil,
+				}
+				self.chunks[key] = chunk
+				self.chunkCount += 1
+			end
+			chunk.refs += 1
+			table.insert(keys, key)
+		end
+	end
+	return keys
+end
+
+-- Releases keys from addRegion. Returns chunks that no longer have any snow part over them.
+function SnowField.removeRegion(self: SnowField, keys: { number }): { Chunk }
+	local removed = {}
+	for _, key in keys do
+		local chunk = self.chunks[key]
+		if chunk then
+			chunk.refs -= 1
+			if chunk.refs <= 0 then
+				self.chunks[key] = nil
+				self.chunkCount -= 1
+				table.insert(removed, chunk)
+			end
+		end
+	end
+	return removed
+end
+
+-- Flags every existing chunk near a world rectangle for re-sampling (a snow part moved/changed).
+function SnowField.markStale(self: SnowField, minX: number, maxX: number, minZ: number, maxZ: number)
+	local m = self.params.edgeFalloff + self.params.cellSize * 2
+	local cx0, cx1 = self:chunkRange(minX - m, maxX + m)
+	local cz0, cz1 = self:chunkRange(minZ - m, maxZ + m)
+	for cz = cz0, cz1 do
+		for cx = cx0, cx1 do
+			local chunk = self.chunks[SnowField.chunkKey(cx, cz)]
+			if chunk then
+				chunk.stale = true
+			end
+		end
+	end
+end
+
+--[[
+	Samples the rest surface of a chunk at a given LOD step (1 = every column).
+	`sampler` is called for every column plus an apron around the chunk (so edge thinning is
+	identical on both sides of a chunk border). `budget` is called once per row and may yield.
+]]
+function SnowField.sampleGrid(self: SnowField, chunk: Chunk, step: number, sampler: Sampler, budget: () -> ()): Grid
+	local p = self.params
+	local C, S = p.chunkCells, p.cellSize
+	local n = C // step + 1
+	local cellW = S * step
+	local A = if p.edgeFalloff > 0 then math.ceil(p.edgeFalloff / cellW) + 1 else 1
+	local W = n + 2 * A
+	local ox, oz = chunk.cx * C, chunk.cz * C
+	local maxSlopeCos = p.maxSlopeCos
+
+	local baseE: { number } = table.create(W * W, NO_SNOW)
+	local thickE: { number } = table.create(W * W, 0)
+
+	for ez = 0, W - 1 do
+		local wz = (oz + (ez - A) * step) * S
+		local row = ez * W
+		for ex = 0, W - 1 do
+			local wx = (ox + (ex - A) * step) * S
+			local y, ny, depth = sampler(wx, wz)
+			if y and depth > 0 then
+				local slope = smoothstep(maxSlopeCos, maxSlopeCos + 0.12, ny)
+				if slope > 0 then
+					baseE[row + ex + 1] = y
+					thickE[row + ex + 1] = depth * slope
+				end
+			end
+		end
+		budget()
+	end
+
+	-- Distance (in cells) to the nearest edge of the snow: empty columns or tall cliffs.
+	local dist: { number } = table.create(W * W, INF)
+	local cliff = p.cliffHeight
+	for ez = 0, W - 1 do
+		local row = ez * W
+		for ex = 0, W - 1 do
+			local e = row + ex + 1
+			local b = baseE[e]
+			if b <= NO_SNOW_LIMIT then
+				dist[e] = 0
+			else
+				local seed = false
+				if ex > 0 then
+					local nb = baseE[e - 1]
+					seed = nb <= NO_SNOW_LIMIT or math.abs(nb - b) > cliff
+				end
+				if not seed and ex < W - 1 then
+					local nb = baseE[e + 1]
+					seed = nb <= NO_SNOW_LIMIT or math.abs(nb - b) > cliff
+				end
+				if not seed and ez > 0 then
+					local nb = baseE[e - W]
+					seed = nb <= NO_SNOW_LIMIT or math.abs(nb - b) > cliff
+				end
+				if not seed and ez < W - 1 then
+					local nb = baseE[e + W]
+					seed = nb <= NO_SNOW_LIMIT or math.abs(nb - b) > cliff
+				end
+				if seed then
+					dist[e] = 0.5
+				end
+			end
+		end
+	end
+	-- two-pass chamfer distance transform
+	for ez = 0, W - 1 do
+		local row = ez * W
+		for ex = 0, W - 1 do
+			local e = row + ex + 1
+			local d = dist[e]
+			if d > 0 then
+				if ex > 0 and dist[e - 1] + 1 < d then
+					d = dist[e - 1] + 1
+				end
+				if ez > 0 then
+					if dist[e - W] + 1 < d then
+						d = dist[e - W] + 1
+					end
+					if ex > 0 and dist[e - W - 1] + SQRT2 < d then
+						d = dist[e - W - 1] + SQRT2
+					end
+					if ex < W - 1 and dist[e - W + 1] + SQRT2 < d then
+						d = dist[e - W + 1] + SQRT2
+					end
+				end
+				dist[e] = d
+			end
+		end
+	end
+	for ez = W - 1, 0, -1 do
+		local row = ez * W
+		for ex = W - 1, 0, -1 do
+			local e = row + ex + 1
+			local d = dist[e]
+			if d > 0 then
+				if ex < W - 1 and dist[e + 1] + 1 < d then
+					d = dist[e + 1] + 1
+				end
+				if ez < W - 1 then
+					if dist[e + W] + 1 < d then
+						d = dist[e + W] + 1
+					end
+					if ex < W - 1 and dist[e + W + 1] + SQRT2 < d then
+						d = dist[e + W + 1] + SQRT2
+					end
+					if ex > 0 and dist[e + W - 1] + SQRT2 < d then
+						d = dist[e + W - 1] + SQRT2
+					end
+				end
+				dist[e] = d
+			end
+		end
+	end
+
+	local base = buffer.create(n * n * 4)
+	local rest = buffer.create(n * n * 4)
+	local minY, maxY, count = math.huge, -math.huge, 0
+	local falloff = p.edgeFalloff
+	local minT = p.minThickness
+	local rimRatio = p.rimRatio
+	for lz = 0, n - 1 do
+		for lx = 0, n - 1 do
+			local e = (lz + A) * W + (lx + A) + 1
+			local o = (lz * n + lx) * 4
+			local b = baseE[e]
+			if b > NO_SNOW_LIMIT then
+				local taper = if falloff > 0 then smoothstep(0, falloff, (dist[e] - 0.5) * cellW) else 1
+				local th = math.max(minT, thickE[e] * taper)
+				writef32(base, o, b)
+				writef32(rest, o, b + th)
+				count += 1
+				if b < minY then
+					minY = b
+				end
+				local top = b + th * (1 + rimRatio)
+				if top > maxY then
+					maxY = top
+				end
+			else
+				writef32(base, o, NO_SNOW)
+				writef32(rest, o, NO_SNOW)
+			end
+		end
+	end
+	if count == 0 then
+		minY, maxY = 0, 0
+	end
+
+	return {
+		step = step,
+		n = n,
+		base = base,
+		rest = rest,
+		minY = minY,
+		maxY = maxY,
+		snowCount = count,
+	}
+end
+
+local function markDirty(chunk: Chunk, i: number)
+	if chunk.dirty[i] ~= 1 then
+		if chunk.dirty[i] == nil then
+			chunk.dirtyCount += 1
+		end
+		chunk.dirty[i] = 1
+	end
+	chunk.version += 1
+end
+SnowField.markDirty = markDirty
+
+-- Low-resolution rest surface used to draw far-away chunks that are not simulated.
+function SnowField.attachCoarse(self: SnowField, chunk: Chunk, grid: Grid)
+	chunk.coarse[grid.step] = grid
+	if not chunk.full then
+		chunk.gridVersion += 1
+	end
+end
+
+--[[
+	Makes a chunk deformable using a step-1 grid. If the chunk was already simulated (re-sample after
+	a part moved) existing prints/rims are carried over relative to the new rest surface.
+]]
+function SnowField.attachFull(self: SnowField, chunk: Chunk, grid: Grid, now: number)
+	assert(grid.step == 1, "full grids must be sampled at step 1")
+	local p = self.params
+	local count = grid.n * grid.n
+	local cur = buffer.create(count * 4)
+	buffer.copy(cur, 0, grid.rest, 0, count * 4)
+	local hit = buffer.create(count * 4)
+	local full: Full = {
+		step = 1,
+		n = grid.n,
+		base = grid.base,
+		rest = grid.rest,
+		cur = cur,
+		hit = hit,
+		minY = grid.minY,
+		maxY = grid.maxY,
+		snowCount = grid.snowCount,
+		active = {},
+		activeCount = 0,
+		lastRegrow = now,
+	}
+
+	local old = chunk.full
+	if old and old.n == full.n and old.activeCount > 0 then
+		local minT = p.minThickness
+		for i in old.active do
+			local o = i * 4
+			local nb = readf32(full.base, o)
+			if nb > NO_SNOW_LIMIT then
+				local delta = readf32(old.cur, o) - readf32(old.rest, o)
+				local nr = readf32(full.rest, o)
+				local v = nr + delta
+				if v < nb + minT then
+					v = nb + minT
+				end
+				local maxRim = nr + (nr - nb) * p.rimRatio
+				if v > maxRim then
+					v = maxRim
+				end
+				writef32(cur, o, v)
+				writef32(hit, o, readf32(old.hit, o))
+				if math.abs(v - nr) > EPS * 0.5 then
+					full.active[i] = true
+					full.activeCount += 1
+				end
+			end
+		end
+	end
+
+	chunk.full = full
+	chunk.gridVersion += 1
+	chunk.version += 1
+
+	local pending = chunk.pending
+	if pending then
+		chunk.pending = nil
+		for _, item in pending do
+			self:stampAged(item.shape, now, item.hitTime, chunk)
+		end
+	end
+end
+
+-- Forgets the simulation of a chunk (only call when it has nothing left to regrow).
+function SnowField.dropFull(self: SnowField, chunk: Chunk)
+	if chunk.full then
+		chunk.full = nil
+		chunk.gridVersion += 1
+	end
+end
+
+function SnowField.clearGrids(self: SnowField, chunk: Chunk)
+	chunk.coarse = {}
+	chunk.gridVersion += 1
+end
+
+--[[
+	Presses a shape into the snow.
+	  raise    - lifts the result (used to replay old prints that have partially regrown)
+	  hitTime  - the time stored as "last pressed"
+	  only     - restrict to one chunk (used when replaying queued prints)
+	Returns true if any column changed.
+]]
+function SnowField.stamp(
+	self: SnowField,
+	s: Shape,
+	raise: number,
+	hitTime: number,
+	stats: Stats?,
+	only: Chunk?
+): boolean
+	local p = self.params
+	local S, C = p.cellSize, p.chunkCells
+	local rimW = if p.rimRatio > 0 then p.rimWidth else 0
+	local rimRatio = p.rimRatio
+	local minT = p.minThickness
+
+	local gx0 = math.ceil((s.minX - rimW) / S)
+	local gx1 = math.floor((s.maxX + rimW) / S)
+	local gz0 = math.ceil((s.minZ - rimW) / S)
+	local gz1 = math.floor((s.maxZ + rimW) / S)
+	if gx1 < gx0 or gz1 < gz0 then
+		return false
+	end
+
+	local cx0, cx1, cz0, cz1
+	if only then
+		cx0, cx1, cz0, cz1 = only.cx, only.cx, only.cz, only.cz
+	else
+		cx0, cx1 = math.ceil(gx0 / C) - 1, math.floor(gx1 / C)
+		cz0, cz1 = math.ceil(gz0 / C) - 1, math.floor(gz1 / C)
+	end
+
+	local changed = false
+	local sMinY = s.minY
+	local chunks = self.chunks
+
+	for cz = cz0, cz1 do
+		for cx = cx0, cx1 do
+			local chunk = if only then only else chunks[SnowField.chunkKey(cx, cz)]
+			local full = chunk and chunk.full
+			if chunk and full and sMinY < full.maxY then
+				local n = full.n
+				local ox, oz = cx * C, cz * C
+				local lx0, lx1 = math.max(0, gx0 - ox), math.min(C, gx1 - ox)
+				local lz0, lz1 = math.max(0, gz0 - oz), math.min(C, gz1 - oz)
+				local baseB, restB, curB, hitB = full.base, full.rest, full.cur, full.hit
+				local active = full.active
+
+				for lz = lz0, lz1 do
+					local wz = (oz + lz) * S
+					local row = lz * n
+					for lx = lx0, lx1 do
+						local i = row + lx
+						local o = i * 4
+						local base = readf32(baseB, o)
+						if base > NO_SNOW_LIMIT then
+							local wx = (ox + lx) * S
+							local cur = readf32(curB, o)
+							local y = lowestAt(s, wx, wz)
+							local handled = false
+
+							if y then
+								local target = y + raise
+								local floorY = base + minT
+								if target < floorY then
+									target = floorY
+								end
+								if target < cur - EPS then
+									-- press the snow down
+									writef32(curB, o, target)
+									if hitTime > readf32(hitB, o) then
+										writef32(hitB, o, hitTime)
+									end
+									if not active[i] then
+										active[i] = true
+										full.activeCount += 1
+									end
+									markDirty(chunk, i)
+									changed = true
+									handled = true
+									if stats then
+										local pen = cur - target
+										stats.volume += pen
+										if pen > stats.maxPen then
+											stats.maxPen = pen
+										end
+										stats.sumX += wx
+										stats.sumY += target
+										stats.sumZ += wz
+										stats.count += 1
+									end
+								elseif y <= cur + CONTACT_EPS then
+									-- resting inside an existing print: keep it from regrowing
+									if hitTime > readf32(hitB, o) then
+										writef32(hitB, o, hitTime)
+									end
+									handled = true
+								end
+							end
+
+							if not handled and rimRatio > 0 then
+								-- push up a little lip of snow around the print
+								local rest = readf32(restB, o)
+								if cur >= rest - EPS then
+									local pen = rest - sMinY
+									if pen > 0 then
+										local depth = rest - base
+										if pen > depth then
+											pen = depth
+										end
+										local d = footprintDistance(s, wx, wz)
+										if d < 0 then
+											d = 0
+										end
+										if d < rimW then
+											local f = 1 - d / rimW
+											local h = rimRatio * pen * f * f - raise
+											if h > 0 then
+												local target = rest + h
+												if y and target > y + raise then
+													target = y + raise
+												end
+												if target > cur + EPS then
+													writef32(curB, o, target)
+													if hitTime > readf32(hitB, o) then
+														writef32(hitB, o, hitTime)
+													end
+													if not active[i] then
+														active[i] = true
+														full.activeCount += 1
+													end
+													markDirty(chunk, i)
+													changed = true
+												elseif target > cur - CONTACT_EPS and hitTime > readf32(hitB, o) then
+													-- still being pushed up: keep the lip from settling
+													writef32(hitB, o, hitTime)
+												end
+											end
+										end
+									end
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+	return changed
+end
+
+-- Replays a print made at `hitTime` (in the local clock): older prints come back partially regrown.
+function SnowField.stampAged(self: SnowField, s: Shape, now: number, hitTime: number, only: Chunk?): boolean
+	local p = self.params
+	local raise = 0
+	if p.regrowSpeed > 0 then
+		raise = math.max(0, now - hitTime - p.regrowDelay) * p.regrowSpeed
+	end
+	return self:stamp(s, raise, hitTime, nil, only)
+end
+
+--[[
+	Queues a print for chunks that are not simulated yet (late-join history / far away players) and
+	applies it right away where the chunk is simulated.
+]]
+function SnowField.queueStamp(self: SnowField, s: Shape, now: number, hitTime: number)
+	local p = self.params
+	local rimW = p.rimWidth
+	local cx0, cx1 = self:chunkRange(s.minX - rimW, s.maxX + rimW)
+	local cz0, cz1 = self:chunkRange(s.minZ - rimW, s.maxZ + rimW)
+	for cz = cz0, cz1 do
+		for cx = cx0, cx1 do
+			local chunk = self.chunks[SnowField.chunkKey(cx, cz)]
+			if chunk then
+				if chunk.full then
+					self:stampAged(s, now, hitTime, chunk)
+				else
+					local list: { Pending } = chunk.pending or {}
+					chunk.pending = list
+					table.insert(list, { shape = s, hitTime = hitTime })
+					if #list > p.maxPendingPerChunk then
+						table.remove(list, 1)
+					end
+				end
+			end
+		end
+	end
+end
+
+--[[
+	Lets pressed snow slowly fill back in (and rims settle back down).
+	Returns the number of columns still regrowing.
+]]
+function SnowField.regrow(self: SnowField, chunk: Chunk, now: number): number
+	local full = chunk.full
+	if not full then
+		return 0
+	end
+	local dt = now - full.lastRegrow
+	full.lastRegrow = now
+	local p = self.params
+	if full.activeCount == 0 or p.regrowSpeed <= 0 or dt <= 0 then
+		return full.activeCount
+	end
+	local amount = p.regrowSpeed * dt
+	local delay = p.regrowDelay
+	local curB, restB, hitB = full.cur, full.rest, full.hit
+	local active = full.active
+	for i in active do
+		local o = i * 4
+		if now - readf32(hitB, o) >= delay then
+			local cur = readf32(curB, o)
+			local rest = readf32(restB, o)
+			local v
+			if cur < rest then
+				v = cur + amount
+				if v > rest then
+					v = rest
+				end
+			else
+				v = cur - amount
+				if v < rest then
+					v = rest
+				end
+			end
+			writef32(curB, o, v)
+			markDirty(chunk, i)
+			if v == rest then
+				active[i] = nil
+				full.activeCount -= 1
+			end
+		end
+	end
+	return full.activeCount
+end
+
+--[[
+	Current surface height of a global column, or nil if there is no snow / no data there.
+	Falls back to a coarse grid when the chunk is not simulated.
+]]
+function SnowField.heightAt(self: SnowField, gx: number, gz: number): number?
+	local C = self.params.chunkCells
+	local cx, cz = gx // C, gz // C
+	local chunk = self.chunks[SnowField.chunkKey(cx, cz)]
+	if not chunk then
+		return nil
+	end
+	local lx, lz = gx - cx * C, gz - cz * C
+	local full = chunk.full
+	if full then
+		local o = (lz * full.n + lx) * 4
+		if readf32(full.base, o) <= NO_SNOW_LIMIT then
+			return nil
+		end
+		return readf32(full.cur, o)
+	end
+	for step, grid in chunk.coarse do
+		if lx % step == 0 and lz % step == 0 then
+			local o = ((lz // step) * grid.n + lx // step) * 4
+			if readf32(grid.base, o) <= NO_SNOW_LIMIT then
+				return nil
+			end
+			return readf32(grid.rest, o)
+		end
+	end
+	return nil
+end
+
+-- Untouched snow depth info at a world point (nearest column): base, rest, cur.
+function SnowField.columnAt(self: SnowField, x: number, z: number): (number?, number, number)
+	local p = self.params
+	local gx = math.floor(x / p.cellSize + 0.5)
+	local gz = math.floor(z / p.cellSize + 0.5)
+	local C = p.chunkCells
+	local cx, cz = gx // C, gz // C
+	local chunk = self.chunks[SnowField.chunkKey(cx, cz)]
+	local full = chunk and chunk.full
+	if not full then
+		return nil, 0, 0
+	end
+	local o = ((gz - cz * C) * full.n + (gx - cx * C)) * 4
+	local base = readf32(full.base, o)
+	if base <= NO_SNOW_LIMIT then
+		return nil, 0, 0
+	end
+	return base, readf32(full.rest, o), readf32(full.cur, o)
+end
+
+return SnowField
+]]></ProtectedString>
+			</Properties>
+		</Item>
+		<Item class="ModuleScript" referent="RBX5D6851B42547400EA0CA062D6FAB9518">
+			<Properties>
+				<string name="Name">StampCodec</string>
+				<ProtectedString name="Source"><![CDATA[--!strict
+--[[
+	StampCodec
+	Packs footprints ("stamps") into compact buffers for RemoteEvents.
+
+	client -> server : u16 count, then per stamp 37 bytes
+	    u8 kind | f32 px py pz | f32 sx sy sz | i16 rightX rightY rightZ upX upY upZ
+	server -> client : u16 count, then per stamp 53 bytes
+	    f64 userId | f64 serverTime | <the 37 bytes above>
+
+	Pure Luau (only the `buffer` library) so it is unit-testable outside Roblox.
+]]
+
+local StampCodec = {}
+
+export type Stamp = {
+	kind: number,
+	px: number,
+	py: number,
+	pz: number,
+	r00: number,
+	r01: number,
+	r02: number,
+	r10: number,
+	r11: number,
+	r12: number,
+	r20: number,
+	r21: number,
+	r22: number,
+	sx: number,
+	sy: number,
+	sz: number,
+	userId: number,
+	time: number,
+}
+
+local BODY = 37
+local RELAY = 53
+StampCodec.BODY_SIZE = BODY
+StampCodec.RELAY_SIZE = RELAY
+StampCodec.MAX_PER_PACKET = 400
+
+local Q = 32767
+
+local function finite(x: number, limit: number): boolean
+	return x == x and x > -limit and x < limit
+end
+
+local function clampUnit(x: number): number
+	if x > 1 then
+		return 1
+	elseif x < -1 then
+		return -1
+	end
+	return x
+end
+
+local function writeBody(b: buffer, o: number, s: Stamp)
+	buffer.writeu8(b, o, s.kind)
+	buffer.writef32(b, o + 1, s.px)
+	buffer.writef32(b, o + 5, s.py)
+	buffer.writef32(b, o + 9, s.pz)
+	buffer.writef32(b, o + 13, s.sx)
+	buffer.writef32(b, o + 17, s.sy)
+	buffer.writef32(b, o + 21, s.sz)
+	buffer.writei16(b, o + 25, math.round(clampUnit(s.r00) * Q))
+	buffer.writei16(b, o + 27, math.round(clampUnit(s.r10) * Q))
+	buffer.writei16(b, o + 29, math.round(clampUnit(s.r20) * Q))
+	buffer.writei16(b, o + 31, math.round(clampUnit(s.r01) * Q))
+	buffer.writei16(b, o + 33, math.round(clampUnit(s.r11) * Q))
+	buffer.writei16(b, o + 35, math.round(clampUnit(s.r21) * Q))
+end
+
+-- Reads one body; returns nil if anything is malformed (NaN, absurd sizes, degenerate rotation).
+local function readBody(b: buffer, o: number, userId: number, time: number): Stamp?
+	local kind = buffer.readu8(b, o)
+	if kind < 1 or kind > 3 then
+		return nil
+	end
+	local px, py, pz = buffer.readf32(b, o + 1), buffer.readf32(b, o + 5), buffer.readf32(b, o + 9)
+	local sx, sy, sz = buffer.readf32(b, o + 13), buffer.readf32(b, o + 17), buffer.readf32(b, o + 21)
+	if not (finite(px, 1e6) and finite(py, 1e6) and finite(pz, 1e6)) then
+		return nil
+	end
+	if not (finite(sx, 64) and finite(sy, 64) and finite(sz, 64)) or sx <= 0 or sy <= 0 or sz <= 0 then
+		return nil
+	end
+	-- right (X) and up (Y) axes, re-orthonormalised; Z = X cross Y
+	local ax, ay, az = buffer.readi16(b, o + 25) / Q, buffer.readi16(b, o + 27) / Q, buffer.readi16(b, o + 29) / Q
+	local bx, by, bz = buffer.readi16(b, o + 31) / Q, buffer.readi16(b, o + 33) / Q, buffer.readi16(b, o + 35) / Q
+	local la = math.sqrt(ax * ax + ay * ay + az * az)
+	if la < 0.5 then
+		return nil
+	end
+	ax, ay, az = ax / la, ay / la, az / la
+	local dot = ax * bx + ay * by + az * bz
+	bx, by, bz = bx - dot * ax, by - dot * ay, bz - dot * az
+	local lb = math.sqrt(bx * bx + by * by + bz * bz)
+	if lb < 0.5 then
+		return nil
+	end
+	bx, by, bz = bx / lb, by / lb, bz / lb
+	local cx, cy, cz = ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx
+	return {
+		kind = kind,
+		px = px,
+		py = py,
+		pz = pz,
+		r00 = ax,
+		r10 = ay,
+		r20 = az,
+		r01 = bx,
+		r11 = by,
+		r21 = bz,
+		r02 = cx,
+		r12 = cy,
+		r22 = cz,
+		sx = sx,
+		sy = sy,
+		sz = sz,
+		userId = userId,
+		time = time,
+	}
+end
+
+function StampCodec.encodeClient(list: { Stamp }): buffer
+	local count = math.min(#list, StampCodec.MAX_PER_PACKET)
+	local b = buffer.create(2 + count * BODY)
+	buffer.writeu16(b, 0, count)
+	for i = 1, count do
+		writeBody(b, 2 + (i - 1) * BODY, list[i])
+	end
+	return b
+end
+
+function StampCodec.decodeClient(b: any, userId: number, time: number): { Stamp }?
+	if typeof(b) ~= "buffer" then
+		return nil
+	end
+	local len = buffer.len(b)
+	if len < 2 then
+		return nil
+	end
+	local count = buffer.readu16(b, 0)
+	if count > StampCodec.MAX_PER_PACKET or len ~= 2 + count * BODY then
+		return nil
+	end
+	local out = {}
+	for i = 1, count do
+		local s = readBody(b, 2 + (i - 1) * BODY, userId, time)
+		if s then
+			table.insert(out, s)
+		end
+	end
+	return out
+end
+
+function StampCodec.encodeRelay(list: { Stamp }, first: number?, last: number?): buffer
+	local i0 = first or 1
+	local i1 = math.min(last or #list, #list, i0 + StampCodec.MAX_PER_PACKET - 1)
+	local count = math.max(0, i1 - i0 + 1)
+	local b = buffer.create(2 + count * RELAY)
+	buffer.writeu16(b, 0, count)
+	for k = 0, count - 1 do
+		local s = list[i0 + k]
+		local o = 2 + k * RELAY
+		buffer.writef64(b, o, s.userId)
+		buffer.writef64(b, o + 8, s.time)
+		writeBody(b, o + 16, s)
+	end
+	return b
+end
+
+function StampCodec.decodeRelay(b: any): { Stamp }?
+	if typeof(b) ~= "buffer" then
+		return nil
+	end
+	local len = buffer.len(b)
+	if len < 2 then
+		return nil
+	end
+	local count = buffer.readu16(b, 0)
+	if len ~= 2 + count * RELAY then
+		return nil
+	end
+	local out = {}
+	for k = 0, count - 1 do
+		local o = 2 + k * RELAY
+		local s = readBody(b, o + 16, buffer.readf64(b, o), buffer.readf64(b, o + 8))
+		if s then
+			table.insert(out, s)
+		end
+	end
+	return out
+end
+
+return StampCodec
+]]></ProtectedString>
+			</Properties>
+		</Item>
+		<Item class="ModuleScript" referent="RBX13AABA5B0F0942D09D8D0B77AABEE6C4">
+			<Properties>
+				<string name="Name">ChunkMesh</string>
+				<ProtectedString name="Source"><![CDATA[--!strict
+--[[
+	ChunkMesh
+	Draws one SnowField chunk as an EditableMesh-backed MeshPart and keeps it in sync with the
+	simulation (only the vertices that actually changed are re-uploaded).
+
+	* step = level of detail (1 = every column, 2 = every other column, ...).
+	* Snow that has been pressed down is tinted (vertex colours multiply MeshPart.Color).
+	* Every chunk border gets a thin "skirt" hanging down to the ground so no cracks show between
+	  neighbouring chunks drawn at different detail levels.
+	* Two microscopic triangles pin the mesh bounding box so it never changes size while the
+	  surface is being deformed (keeps the MeshPart from shifting/scaling).
+]]
+
+local AssetService = game:GetService("AssetService")
+
+local SnowField = require(script.Parent.SnowField)
+
+local readf32 = buffer.readf32
+local NO_SNOW_LIMIT = SnowField.NO_SNOW_LIMIT
+local WHITE = Color3.new(1, 1, 1)
+
+local ChunkMesh = {}
+ChunkMesh.__index = ChunkMesh
+
+export type Style = {
+	color: Color3,
+	packedTint: Color3,
+	material: Enum.Material,
+	materialVariant: string,
+	studsPerTile: number,
+	castShadow: boolean,
+	parent: Instance,
+}
+
+export type ChunkMesh = typeof(setmetatable(
+	{} :: {
+		step: number,
+		nSide: number,
+		em: EditableMesh,
+		part: MeshPart?,
+		order: { [number]: number }, -- lod index -> slot
+		vids: { number }, -- slot -> vertex id
+		nids: { number }, -- slot -> normal id
+		cids: { number }, -- slot -> color id
+		lodIndex: { number }, -- slot -> lod index
+		gridVersion: number,
+		version: number,
+		half: number,
+		midY: number,
+		usesFull: boolean,
+		batch: boolean,
+		destroyed: boolean,
+	},
+	ChunkMesh
+))
+
+-- Batch APIs are much faster; fall back to the per-element API on engines without them.
+local batchSupported: boolean? = nil
+local function hasBatch(em: EditableMesh): boolean
+	if batchSupported == nil then
+		batchSupported = pcall(function()
+			return (em :: any).BatchSetValues ~= nil and (em :: any).BatchAdd ~= nil
+		end)
+	end
+	return batchSupported :: boolean
+end
+
+local function packedColor(base: number, rest: number, cur: number, tint: Color3): Color3
+	if cur >= rest - 1e-3 then
+		return WHITE
+	end
+	local depth = rest - base
+	if depth < 0.05 then
+		depth = 0.05
+	end
+	local t = (rest - cur) / depth * 1.6
+	if t > 1 then
+		t = 1
+	end
+	return WHITE:Lerp(tint, t)
+end
+
+type Source = {
+	base: buffer,
+	rest: buffer,
+	cur: buffer,
+	n: number,
+	stride: number,
+	minY: number,
+	maxY: number,
+}
+
+local function sourceFor(chunk: SnowField.Chunk, step: number): Source?
+	local full = chunk.full
+	if full then
+		return {
+			base = full.base,
+			rest = full.rest,
+			cur = full.cur,
+			n = full.n,
+			stride = step,
+			minY = full.minY,
+			maxY = full.maxY,
+		}
+	end
+	local g = chunk.coarse[step]
+	if g then
+		return {
+			base = g.base,
+			rest = g.rest,
+			cur = g.rest,
+			n = g.n,
+			stride = 1,
+			minY = g.minY,
+			maxY = g.maxY,
+		}
+	end
+	return nil
+end
+
+-- Height of LOD vertex (i, j) of this chunk, reaching into neighbour chunks when outside.
+local function lodHeight(
+	field: SnowField.SnowField,
+	chunk: SnowField.Chunk,
+	src: Source,
+	step: number,
+	nSide: number,
+	i: number,
+	j: number
+): number?
+	if i >= 0 and j >= 0 and i < nSide and j < nSide then
+		local o = ((j * src.stride) * src.n + i * src.stride) * 4
+		if readf32(src.base, o) <= NO_SNOW_LIMIT then
+			return nil
+		end
+		return readf32(src.cur, o)
+	end
+	local C = field.params.chunkCells
+	return field:heightAt(chunk.cx * C + i * step, chunk.cz * C + j * step)
+end
+
+local function lodNormal(
+	field: SnowField.SnowField,
+	chunk: SnowField.Chunk,
+	src: Source,
+	step: number,
+	nSide: number,
+	i: number,
+	j: number,
+	h: number
+): Vector3
+	local hl = lodHeight(field, chunk, src, step, nSide, i - 1, j) or h
+	local hr = lodHeight(field, chunk, src, step, nSide, i + 1, j) or h
+	local hd = lodHeight(field, chunk, src, step, nSide, i, j - 1) or h
+	local hu = lodHeight(field, chunk, src, step, nSide, i, j + 1) or h
+	local w = 2 * step * field.params.cellSize
+	return Vector3.new(hl - hr, w, hd - hu).Unit
+end
+
+--[[
+	Builds the mesh for a chunk. May yield (calls `budget` and CreateMeshPartAsync).
+	Returns nil plus a reason when nothing could be built:
+	  "empty"  - no snow in this chunk
+	  "nodata" - the requested grid is not sampled
+	  "budget" - the device ran out of EditableMesh memory
+	  "error"  - the engine refused (e.g. Mesh/Image APIs disabled for this experience)
+]]
+function ChunkMesh.build(
+	field: SnowField.SnowField,
+	chunk: SnowField.Chunk,
+	step: number,
+	style: Style,
+	budget: () -> ()
+): (ChunkMesh?, string?)
+	local src = sourceFor(chunk, step)
+	if not src then
+		return nil, "nodata"
+	end
+	local gridVersion = chunk.gridVersion
+	local version = chunk.version
+	local p = field.params
+	local C, S = p.chunkCells, p.cellSize
+	local cliff = p.cliffHeight
+	local nSide = C // step + 1
+	local half = C * S * 0.5
+	local minY, maxY = src.minY - 0.1, src.maxY + 0.1
+	local midY = (minY + maxY) * 0.5
+	local halfY = (maxY - minY) * 0.5
+	local tile = style.studsPerTile
+	local cxw, czw = field:chunkCenter(chunk)
+	local tint = style.packedTint
+
+	-- 1) collect snow columns of this LOD
+	local exists: { [number]: boolean } = {}
+	local baseOf: { [number]: number } = {}
+	local curOf: { [number]: number } = {}
+	local restOf: { [number]: number } = {}
+	for j = 0, nSide - 1 do
+		for i = 0, nSide - 1 do
+			local o = ((j * src.stride) * src.n + i * src.stride) * 4
+			local b = readf32(src.base, o)
+			if b > NO_SNOW_LIMIT then
+				local idx = j * nSide + i
+				exists[idx] = true
+				baseOf[idx] = b
+				restOf[idx] = readf32(src.rest, o)
+				curOf[idx] = readf32(src.cur, o)
+			end
+		end
+	end
+
+	-- 2) triangles (CCW seen from above), skipping tall cliffs
+	local tris: { number } = {} -- flat list of lod indices, 3 per triangle
+	local used: { [number]: boolean } = {}
+	local function tri(a: number, b: number, c: number)
+		local ba, bb, bc = baseOf[a], baseOf[b], baseOf[c]
+		if math.max(ba, bb, bc) - math.min(ba, bb, bc) > cliff then
+			return
+		end
+		table.insert(tris, a)
+		table.insert(tris, b)
+		table.insert(tris, c)
+		used[a], used[b], used[c] = true, true, true
+	end
+	for j = 0, nSide - 2 do
+		for i = 0, nSide - 2 do
+			local a = j * nSide + i -- (i, j)
+			local b = a + 1 -- (i+1, j)
+			local c = a + nSide -- (i, j+1)
+			local d = c + 1 -- (i+1, j+1)
+			local ea, eb, ec, ed = exists[a], exists[b], exists[c], exists[d]
+			if ea and eb and ec and ed then
+				if (i + j) % 2 == 0 then
+					tri(a, c, b)
+					tri(b, c, d)
+				else
+					tri(a, c, d)
+					tri(a, d, b)
+				end
+			elseif eb and ec and ed then
+				tri(b, c, d)
+			elseif ea and ec and ed then
+				tri(a, c, d)
+			elseif ea and eb and ed then
+				tri(a, d, b)
+			elseif ea and eb and ec then
+				tri(a, c, b)
+			end
+		end
+		if j % 8 == 0 then
+			budget()
+		end
+	end
+	if #tris == 0 then
+		return nil, "empty"
+	end
+
+	-- 3) one vertex + one normal/uv/colour per used surface column
+	local order: { [number]: number } = {}
+	local lodIndex: { number } = {}
+	local positions: { Vector3 } = {}
+	local normals: { Vector3 } = {}
+	local uvs: { Vector2 } = {}
+	local colors: { Color3 } = {}
+	local alphas: { number } = {}
+	for j = 0, nSide - 1 do
+		for i = 0, nSide - 1 do
+			local idx = j * nSide + i
+			if used[idx] then
+				local slot = #positions + 1
+				order[idx] = slot
+				lodIndex[slot] = idx
+				local h = curOf[idx]
+				local lx, lz = i * step * S - half, j * step * S - half
+				positions[slot] = Vector3.new(lx, h - midY, lz)
+				normals[slot] = lodNormal(field, chunk, src, step, nSide, i, j, h)
+				uvs[slot] = Vector2.new((cxw + lx) / tile, (czw + lz) / tile)
+				colors[slot] = packedColor(baseOf[idx], restOf[idx], h, tint)
+				alphas[slot] = 1
+			end
+		end
+		if j % 8 == 0 then
+			budget()
+		end
+	end
+	local surfaceCount = #positions
+
+	-- face list: {vertex slots} + {attribute slots}
+	local faceVerts: { { number } } = {}
+	local faceAttr: { { number } } = {}
+	for t = 1, #tris, 3 do
+		local sa, sb, sc = order[tris[t]], order[tris[t + 1]], order[tris[t + 2]]
+		table.insert(faceVerts, { sa, sb, sc })
+		table.insert(faceAttr, { sa, sb, sc })
+	end
+
+	-- 4) skirts along the four chunk borders (double sided), hanging down to the ground
+	local skirtSlot: { [number]: number } = {}
+	local function skirtBottom(idx: number): number
+		local existing = skirtSlot[idx]
+		if existing then
+			return existing
+		end
+		local pos = positions[order[idx]]
+		local s = #positions + 1
+		positions[s] = Vector3.new(pos.X, baseOf[idx] + 0.01 - midY, pos.Z)
+		skirtSlot[idx] = s
+		return s
+	end
+	local function skirtEdge(a: number, b: number)
+		if not (used[a] and used[b]) then
+			return
+		end
+		local ta, tb = order[a], order[b]
+		local ba, bb = skirtBottom(a), skirtBottom(b)
+		-- both windings so it hides cracks from either side
+		table.insert(faceVerts, { ta, ba, tb })
+		table.insert(faceAttr, { ta, ta, tb })
+		table.insert(faceVerts, { tb, ba, bb })
+		table.insert(faceAttr, { tb, ta, tb })
+		table.insert(faceVerts, { ta, tb, ba })
+		table.insert(faceAttr, { ta, tb, ta })
+		table.insert(faceVerts, { tb, bb, ba })
+		table.insert(faceAttr, { tb, tb, ta })
+	end
+	local last = nSide - 1
+	for k = 0, nSide - 2 do
+		skirtEdge(k, k + 1) -- j = 0
+		skirtEdge(last * nSide + k, last * nSide + k + 1) -- j = last
+		skirtEdge(k * nSide, (k + 1) * nSide) -- i = 0
+		skirtEdge(k * nSide + last, (k + 1) * nSide + last) -- i = last
+	end
+
+	-- 5) bounding box pins (sub-pixel triangles in two opposite corners)
+	local function pin(x: number, y: number, z: number, dx: number)
+		local s = #positions
+		positions[s + 1] = Vector3.new(x, y, z)
+		positions[s + 2] = Vector3.new(x + dx, y, z)
+		positions[s + 3] = Vector3.new(x, y, z + dx)
+		table.insert(faceVerts, { s + 1, s + 3, s + 2 })
+		table.insert(faceAttr, { 1, 1, 1 })
+	end
+	pin(-half, -halfY, -half, 0.01)
+	pin(half, halfY, half, -0.01)
+
+	-- 6) upload
+	local okCreate, em = pcall(AssetService.CreateEditableMesh, AssetService)
+	if not okCreate then
+		return nil, "error"
+	end
+	if em == nil then
+		return nil, "budget"
+	end
+	local editable = em :: EditableMesh
+
+	local useBatch = hasBatch(editable)
+	local vids: { number }, nids: { number }, uvids: { number }, cids: { number } = {}, {}, {}, {}
+	local okBuild, buildErr = pcall(function()
+		if useBatch then
+			vids = editable:BatchAdd(Enum.MeshAttribute.Vertex, positions) :: any
+			nids = editable:BatchAdd(Enum.MeshAttribute.Normal, normals) :: any
+			uvids = editable:BatchAdd(Enum.MeshAttribute.UV, uvs) :: any
+			cids = (editable :: any):BatchAdd(Enum.MeshAttribute.Color, colors, alphas)
+			local fv = table.create(#faceVerts)
+			local fn = table.create(#faceVerts)
+			local fu = table.create(#faceVerts)
+			local fc = table.create(#faceVerts)
+			for f, v in faceVerts do
+				local a = faceAttr[f]
+				fv[f] = { vids[v[1]], vids[v[2]], vids[v[3]] }
+				fn[f] = { nids[a[1]], nids[a[2]], nids[a[3]] }
+				fu[f] = { uvids[a[1]], uvids[a[2]], uvids[a[3]] }
+				fc[f] = { cids[a[1]], cids[a[2]], cids[a[3]] }
+			end
+			local fids = editable:BatchAdd(Enum.MeshAttribute.Face, fv)
+			editable:BatchSetFaceAttributes(fids, fn)
+			editable:BatchSetFaceAttributes(fids, fu)
+			editable:BatchSetFaceAttributes(fids, fc)
+		else
+			for s, pos in positions do
+				vids[s] = editable:AddVertex(pos)
+				if s % 512 == 0 then
+					budget()
+				end
+			end
+			for s = 1, surfaceCount do
+				nids[s] = editable:AddNormal(normals[s])
+				uvids[s] = editable:AddUV(uvs[s])
+				cids[s] = editable:AddColor(colors[s], 1)
+				if s % 256 == 0 then
+					budget()
+				end
+			end
+			for f, v in faceVerts do
+				local a = faceAttr[f]
+				local fid = editable:AddTriangle(vids[v[1]], vids[v[2]], vids[v[3]])
+				editable:SetFaceNormals(fid, { nids[a[1]], nids[a[2]], nids[a[3]] })
+				editable:SetFaceUVs(fid, { uvids[a[1]], uvids[a[2]], uvids[a[3]] })
+				editable:SetFaceColors(fid, { cids[a[1]], cids[a[2]], cids[a[3]] })
+				if f % 256 == 0 then
+					budget()
+				end
+			end
+		end
+		-- drop the default attributes the engine created while adding faces
+		editable:RemoveUnused()
+	end)
+	if not okBuild then
+		editable:Destroy()
+		warn("[DeformableSnow] mesh build failed:", buildErr)
+		return nil, "error"
+	end
+
+	local okPart, part = pcall(function()
+		return AssetService:CreateMeshPartAsync(Content.fromObject(editable), {
+			CollisionFidelity = Enum.CollisionFidelity.Box,
+			RenderFidelity = Enum.RenderFidelity.Precise,
+		})
+	end)
+	if not okPart or part == nil then
+		editable:Destroy()
+		warn("[DeformableSnow] CreateMeshPartAsync failed:", part)
+		return nil, "error"
+	end
+	local mp = part :: MeshPart
+	mp.Name = `SnowChunk_{chunk.cx}_{chunk.cz}`
+	mp.Anchored = true
+	mp.CanCollide = false
+	mp.CanTouch = false
+	mp.CanQuery = false
+	mp.CastShadow = style.castShadow
+	mp.Material = style.material
+	if style.materialVariant ~= "" then
+		mp.MaterialVariant = style.materialVariant
+	end
+	mp.Color = style.color
+	-- render the mesh 1:1 (its bounds are pinned, so this never changes afterwards)
+	local okSize, meshSize = pcall(function()
+		return mp.MeshSize
+	end)
+	if okSize and typeof(meshSize) == "Vector3" and meshSize.X > 0 and meshSize.Y > 0 and meshSize.Z > 0 then
+		mp.Size = meshSize
+	end
+	mp.CFrame = CFrame.new(cxw, midY, czw)
+
+	local self = setmetatable({
+		step = step,
+		nSide = nSide,
+		em = editable,
+		part = mp,
+		order = order,
+		vids = vids,
+		nids = nids,
+		cids = cids,
+		lodIndex = lodIndex,
+		gridVersion = gridVersion,
+		version = version,
+		half = half,
+		midY = midY,
+		usesFull = chunk.full ~= nil,
+		batch = useBatch,
+		destroyed = false,
+	}, ChunkMesh)
+	mp.Parent = style.parent
+	return self, nil
+end
+
+function ChunkMesh.destroy(self: ChunkMesh)
+	if self.destroyed then
+		return
+	end
+	self.destroyed = true
+	if self.part then
+		self.part:Destroy()
+		self.part = nil
+	end
+	self.em:Destroy()
+end
+
+--[[
+	Re-uploads the vertices touched by the dirty columns of a simulated chunk.
+	dirty: full-grid column index -> 1 (height changed) | 2 (only the normal needs refreshing)
+	all:   refresh every vertex
+]]
+function ChunkMesh.applyDirty(
+	self: ChunkMesh,
+	field: SnowField.SnowField,
+	chunk: SnowField.Chunk,
+	dirty: { [number]: number }?,
+	all: boolean?,
+	tint: Color3
+)
+	if self.destroyed then
+		return
+	end
+	local full = chunk.full
+	if not full then
+		return
+	end
+	local step, nSide = self.step, self.nSide
+	local n = full.n
+	local posSet: { [number]: boolean } = {}
+	local normSet: { [number]: boolean } = {}
+
+	if all then
+		for slot, idx in self.lodIndex do
+			posSet[idx] = true
+			normSet[idx] = true
+		end
+	elseif dirty then
+		for i, flag in dirty do
+			local lx, lz = i % n, i // n
+			if lx % step == 0 and lz % step == 0 then
+				local li, lj = lx // step, lz // step
+				local idx = lj * nSide + li
+				normSet[idx] = true
+				if flag == 1 then
+					posSet[idx] = true
+					if li > 0 then
+						normSet[idx - 1] = true
+					end
+					if li < nSide - 1 then
+						normSet[idx + 1] = true
+					end
+					if lj > 0 then
+						normSet[idx - nSide] = true
+					end
+					if lj < nSide - 1 then
+						normSet[idx + nSide] = true
+					end
+				end
+			end
+		end
+	end
+
+	local src: Source = {
+		base = full.base,
+		rest = full.rest,
+		cur = full.cur,
+		n = n,
+		stride = step,
+		minY = full.minY,
+		maxY = full.maxY,
+	}
+	local S = field.params.cellSize
+	local half, midY = self.half, self.midY
+	local order = self.order
+
+	local pv: { number }, pp: { Vector3 }, pc: { number }, pcol: { Color3 } = {}, {}, {}, {}
+	for idx in posSet do
+		local slot = order[idx]
+		if slot then
+			local li, lj = idx % nSide, idx // nSide
+			local o = ((lj * step) * n + li * step) * 4
+			local cur = readf32(full.cur, o)
+			table.insert(pv, self.vids[slot])
+			table.insert(pp, Vector3.new(li * step * S - half, cur - midY, lj * step * S - half))
+			table.insert(pc, self.cids[slot])
+			table.insert(pcol, packedColor(readf32(full.base, o), readf32(full.rest, o), cur, tint))
+		end
+	end
+	local nv: { number }, nn: { Vector3 } = {}, {}
+	for idx in normSet do
+		local slot = order[idx]
+		if slot then
+			local li, lj = idx % nSide, idx // nSide
+			local o = ((lj * step) * n + li * step) * 4
+			table.insert(nv, self.nids[slot])
+			table.insert(nn, lodNormal(field, chunk, src, step, nSide, li, lj, readf32(full.cur, o)))
+		end
+	end
+
+	local em = self.em
+	if self.batch then
+		if #pv > 0 then
+			em:BatchSetValues(pv, pp)
+			em:BatchSetValues(pc, pcol)
+		end
+		if #nv > 0 then
+			em:BatchSetValues(nv, nn)
+		end
+	else
+		for k, vid in pv do
+			em:SetPosition(vid, pp[k])
+			em:SetColor(pc[k], pcol[k])
+		end
+		for k, nid in nv do
+			em:SetNormal(nid, nn[k])
+		end
+	end
+end
+
+return ChunkMesh
+]]></ProtectedString>
+			</Properties>
+		</Item>
+		<Item class="ModuleScript" referent="RBXF20C2098E9464E548572F8121B09DA40">
+			<Properties>
+				<string name="Name">SnowClient</string>
+				<ProtectedString name="Source"><![CDATA[--!strict
+--[[
+	SnowClient
+	Runs on every client. Ties everything together:
+	  * tracks every BasePart inside Workspace.SnowParts (collidable or not, any part type)
+	  * reads their top surfaces with raycasts and builds a snow heightfield on top of them
+	  * streams chunks in/out around the camera with 4 levels of detail
+	  * presses snow down under feet, bodies, balls, wheels, crates... every frame
+	  * snow puffs, optional crunch sounds, slows you down in deep fresh snow
+	  * shares your prints through the server so late joiners see the trails too
+]]
+
+local CollectionService = game:GetService("CollectionService")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+
+local Config = require(script.Parent.Config)
+local Shapes = require(script.Parent.Shapes)
+local SnowField = require(script.Parent.SnowField)
+local ChunkMesh = require(script.Parent.ChunkMesh)
+local StampCodec = require(script.Parent.StampCodec)
+
+type Chunk = SnowField.Chunk
+
+type PartInfo = {
+	keys: { number },
+	depth: number,
+	minX: number,
+	maxX: number,
+	minY: number,
+	maxY: number,
+	minZ: number,
+	maxZ: number,
+	conns: { RBXScriptConnection },
+	collider: BasePart?,
+}
+
+type RenderState = {
+	mesh: ChunkMesh.ChunkMesh?,
+	wantStep: number,
+	wantFull: boolean,
+	priority: number,
+	building: boolean,
+	failedUntil: number,
+	emptyVersion: number,
+	emptyStep: number,
+}
+
+type CharInfo = {
+	model: Model,
+	humanoid: Humanoid,
+	root: BasePart?,
+	parts: { BasePart },
+	kinds: { number },
+	simulated: boolean,
+	conns: { RBXScriptConnection },
+	fxCooldown: { [BasePart]: number },
+	lastSent: { [BasePart]: { t: number, pos: Vector3 } },
+}
+
+type DynInfo = {
+	kind: number,
+	lastCF: CFrame?,
+	lastSize: Vector3?,
+	lastStamp: number,
+	lastSeen: number,
+	tagged: boolean,
+}
+
+local SnowClient = {}
+
+------------------------------------------------------------------------ settings
+local CELL = math.clamp(Config.CellSize, 0.1, 4)
+local CHUNK_CELLS = math.clamp((Config.ChunkCells // 8) * 8, 8, 64)
+local CHUNK_SPAN = CELL * CHUNK_CELLS
+local LOD1 = Config.LodDistances[1] or 64
+local LOD2 = Config.LodDistances[2] or 128
+local LOD3 = Config.LodDistances[3] or 256
+local DATA_DISTANCE = LOD1 -- chunks closer than this are always simulated (others only where needed)
+local SIM_DIST2 = Config.SimulationDistance * Config.SimulationDistance
+local BUDGET = math.max(0.5, Config.FrameBudgetMs) / 1000
+local FX_DIST2 = 120 * 120
+local SOUND_DIST2 = 60 * 60
+
+------------------------------------------------------------------------ state
+local t0 = os.clock()
+local function now(): number
+	return os.clock() - t0
+end
+
+local localPlayer = Players.LocalPlayer
+local field: SnowField.SnowField
+local snowFolder: Instance? = nil
+local renderFolder: Folder
+local style: ChunkMesh.Style
+
+local parts: { [BasePart]: PartInfo } = {}
+local chunkParts: { [number]: { [BasePart]: boolean } } = {}
+local refreshQueue: { [BasePart]: boolean } = {}
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Include
+local includeDirty = true
+local groundParams = RaycastParams.new()
+groundParams.FilterType = Enum.RaycastFilterType.Exclude
+groundParams.RespectCanCollide = true
+
+local characters: { [Model]: CharInfo } = {}
+local deformers: { [BasePart]: DynInfo } = {}
+local overlapParams = OverlapParams.new()
+overlapParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local camPos = Vector3.zero
+local stopped = false
+local consecutiveErrors = 0
+local warnedBudget = false
+
+local remote: RemoteEvent? = nil
+local partsReady = false
+local outbox: { StampCodec.Stamp } = {}
+
+-- scratch objects reused every frame
+local shape = Shapes.new()
+local stats = SnowField.newStats()
+
+------------------------------------------------------------------------ helpers
+local function aabb(part: BasePart): (number, number, number, number, number, number)
+	local size = part.Size
+	local px, py, pz, r00, r01, r02, r10, r11, r12, r20, r21, r22 = part.CFrame:GetComponents()
+	local hx, hy, hz = size.X * 0.5, size.Y * 0.5, size.Z * 0.5
+	local ex = math.abs(r00) * hx + math.abs(r01) * hy + math.abs(r02) * hz
+	local ey = math.abs(r10) * hx + math.abs(r11) * hy + math.abs(r12) * hz
+	local ez = math.abs(r20) * hx + math.abs(r21) * hy + math.abs(r22) * hz
+	return px - ex, px + ex, py - ey, py + ey, pz - ez, pz + ez
+end
+
+local function hasTagUpTo(inst: Instance, tag: string, stopAt: Instance?): boolean
+	local node: Instance? = inst
+	while node and node ~= stopAt and node ~= game do
+		if CollectionService:HasTag(node, tag) then
+			return true
+		end
+		node = node.Parent
+	end
+	return false
+end
+
+local function shapeKind(part: BasePart): number
+	if part:IsA("Part") then
+		local s = (part :: Part).Shape
+		if s == Enum.PartType.Ball then
+			return Shapes.BALL
+		elseif s == Enum.PartType.Cylinder then
+			return Shapes.CYLINDER
+		end
+	end
+	return Shapes.BOX
+end
+
+local function partDepth(part: BasePart): number
+	local v = part:GetAttribute("SnowDepth")
+	if typeof(v) == "number" then
+		return math.max(0, v)
+	end
+	return Config.SnowDepth
+end
+
+local function getState(chunk: Chunk): RenderState
+	local rs = chunk.render
+	if rs == nil then
+		rs = {
+			mesh = nil,
+			wantStep = 0,
+			wantFull = false,
+			priority = math.huge,
+			building = false,
+			failedUntil = 0,
+			emptyVersion = -1,
+			emptyStep = 0,
+		}
+		chunk.render = rs
+	end
+	return rs :: RenderState
+end
+
+local function alive(chunk: Chunk): boolean
+	return field.chunks[chunk.key] == chunk
+end
+
+local function destroyRender(chunk: Chunk)
+	local rs = chunk.render :: RenderState?
+	if rs and rs.mesh then
+		rs.mesh:destroy()
+		rs.mesh = nil
+	end
+end
+
+------------------------------------------------------------------------ snow parts
+local function rebuildInclude()
+	local list: { Instance } = {}
+	for part in parts do
+		table.insert(list, part)
+	end
+	rayParams.FilterDescendantsInstances = list
+	includeDirty = false
+end
+
+-- Is there nothing solid under this non-collidable snow part? (then players would fall through it)
+local function needsCollider(part: BasePart, minX: number, maxX: number, minY: number, maxY: number, minZ: number, maxZ: number): boolean
+	local mode = Config.WalkOnNonCollidableSnow
+	if part.CanCollide or mode == false then
+		return false
+	end
+	if mode == true then
+		return true
+	end
+	-- other (collidable) snow parts count as ground; only this part and characters are ignored
+	local exclude: { Instance } = { renderFolder, part }
+	for _, plr in Players:GetPlayers() do
+		if plr.Character then
+			table.insert(exclude, plr.Character)
+		end
+	end
+	for model in characters do
+		table.insert(exclude, model)
+	end
+	groundParams.FilterDescendantsInstances = exclude
+	local dir = Vector3.new(0, -(maxY - minY) - 25, 0)
+	local hits = 0
+	for _, f in { { 0.5, 0.5 }, { 0.15, 0.15 }, { 0.85, 0.15 }, { 0.15, 0.85 }, { 0.85, 0.85 } } do
+		local origin = Vector3.new(minX + (maxX - minX) * f[1], maxY, minZ + (maxZ - minZ) * f[2])
+		if Workspace:Raycast(origin, dir, groundParams) then
+			hits += 1
+		end
+	end
+	return hits < 3
+end
+
+-- Invisible copy of the part that only this client collides with.
+local function makeCollider(part: BasePart): BasePart?
+	local ok, clone = pcall(function()
+		return part:Clone()
+	end)
+	if not ok or not clone then
+		return nil
+	end
+	local c = clone :: BasePart
+	for _, child in c:GetChildren() do
+		child:Destroy()
+	end
+	c.Name = "SnowCollider"
+	c.Transparency = 1
+	c.CanCollide = true
+	c.CanTouch = false
+	c.CastShadow = false
+	c.Anchored = true
+	c.Parent = renderFolder
+	return c
+end
+
+local function trackPart(part: BasePart)
+	if parts[part] or stopped then
+		return
+	end
+	if hasTagUpTo(part, Config.IgnoreTag, Workspace) then
+		return
+	end
+	if not part.CanQuery then
+		-- surfaces are read with raycasts, which skip CanQuery=false parts (local change only)
+		pcall(function()
+			part.CanQuery = true
+		end)
+	end
+	local minX, maxX, minY, maxY, minZ, maxZ = aabb(part)
+	local info: PartInfo = {
+		keys = field:addRegion(minX, maxX, minZ, maxZ),
+		depth = partDepth(part),
+		minX = minX,
+		maxX = maxX,
+		minY = minY,
+		maxY = maxY,
+		minZ = minZ,
+		maxZ = maxZ,
+		conns = {},
+		collider = nil,
+	}
+	if needsCollider(part, minX, maxX, minY, maxY, minZ, maxZ) then
+		info.collider = makeCollider(part)
+	end
+	parts[part] = info
+	for _, key in info.keys do
+		local set = chunkParts[key]
+		if not set then
+			set = {}
+			chunkParts[key] = set
+		end
+		set[part] = true
+	end
+	field:markStale(minX, maxX, minZ, maxZ)
+	includeDirty = true
+
+	local function queue()
+		refreshQueue[part] = true
+	end
+	table.insert(info.conns, part:GetPropertyChangedSignal("CFrame"):Connect(queue))
+	table.insert(info.conns, part:GetPropertyChangedSignal("Size"):Connect(queue))
+	table.insert(info.conns, part:GetAttributeChangedSignal("SnowDepth"):Connect(queue))
+	table.insert(info.conns, part:GetPropertyChangedSignal("CanCollide"):Connect(queue))
+end
+
+-- Releases a PartInfo's chunks. Keys in `keep` (the part's new region) stay mapped to the part.
+local function releaseInfo(part: BasePart, info: PartInfo, keep: { [number]: boolean }?)
+	for _, c in info.conns do
+		c:Disconnect()
+	end
+	if info.collider then
+		info.collider:Destroy()
+		info.collider = nil
+	end
+	for _, key in info.keys do
+		if not (keep and keep[key]) then
+			local set = chunkParts[key]
+			if set then
+				set[part] = nil
+				if next(set) == nil then
+					chunkParts[key] = nil
+				end
+			end
+		end
+	end
+	field:markStale(info.minX, info.maxX, info.minZ, info.maxZ)
+	for _, chunk in field:removeRegion(info.keys) do
+		destroyRender(chunk)
+	end
+	includeDirty = true
+end
+
+local function untrackPart(part: BasePart)
+	local info = parts[part]
+	if not info then
+		return
+	end
+	parts[part] = nil
+	refreshQueue[part] = nil
+	releaseInfo(part, info, nil)
+end
+
+-- A snow part moved/resized: add the new region before releasing the old one so shared chunks
+-- (and the prints in them) survive.
+local function processRefreshQueue()
+	if next(refreshQueue) == nil then
+		return
+	end
+	local list = {}
+	for part in refreshQueue do
+		table.insert(list, part)
+	end
+	table.clear(refreshQueue)
+	for _, part in list do
+		local old = parts[part]
+		parts[part] = nil
+		if part.Parent and snowFolder and part:IsDescendantOf(snowFolder) then
+			trackPart(part)
+		end
+		if old then
+			local new = parts[part]
+			local keep: { [number]: boolean } = {}
+			if new then
+				for _, key in new.keys do
+					keep[key] = true
+				end
+			end
+			releaseInfo(part, old, keep)
+		end
+	end
+end
+
+-- Vertical range of all snow parts around a chunk (so raycasts are short).
+local function chunkYRange(chunk: Chunk): (number, number)
+	local top, bottom = -math.huge, math.huge
+	for dz = -1, 1 do
+		for dx = -1, 1 do
+			local set = chunkParts[SnowField.chunkKey(chunk.cx + dx, chunk.cz + dz)]
+			if set then
+				for part in set do
+					local info = parts[part]
+					if info then
+						if info.maxY > top then
+							top = info.maxY
+						end
+						if info.minY < bottom then
+							bottom = info.minY
+						end
+					end
+				end
+			end
+		end
+	end
+	return top, bottom
+end
+
+local function samplerFor(chunk: Chunk): SnowField.Sampler
+	if includeDirty then
+		rebuildInclude()
+	end
+	local top, bottom = chunkYRange(chunk)
+	if top < bottom then
+		return function(_x: number, _z: number): (number?, number, number)
+			return nil, 0, 0
+		end
+	end
+	local startY = top + 1
+	local dir = Vector3.new(0, -math.min(top - bottom + 2, 10000), 0)
+	return function(x: number, z: number): (number?, number, number)
+		local result = Workspace:Raycast(Vector3.new(x, startY, z), dir, rayParams)
+		if not result then
+			return nil, 0, 0
+		end
+		local info = parts[result.Instance :: BasePart]
+		return result.Position.Y, result.Normal.Y, if info then info.depth else Config.SnowDepth
+	end
+end
+
+------------------------------------------------------------------------ background loader
+local workStart = os.clock()
+local function budget()
+	if os.clock() - workStart > BUDGET then
+		RunService.Heartbeat:Wait()
+		workStart = os.clock()
+	end
+end
+
+local workList: { Chunk } = {}
+
+local function needsWork(chunk: Chunk, rs: RenderState): boolean
+	if rs.building or now() < rs.failedUntil then
+		return false
+	end
+	if chunk.stale then
+		return true
+	end
+	if rs.wantFull and not chunk.full then
+		return true
+	end
+	local step = rs.wantStep
+	if step > 0 then
+		if not chunk.full and not chunk.coarse[step] then
+			return true
+		end
+		if rs.emptyVersion == chunk.gridVersion and rs.emptyStep == step then
+			return false
+		end
+		local mesh = rs.mesh
+		if not mesh or mesh.step ~= step or mesh.gridVersion ~= chunk.gridVersion then
+			return true
+		end
+	end
+	return false
+end
+
+local function stopAll(reason: string)
+	if stopped then
+		return
+	end
+	stopped = true
+	warn("[DeformableSnow] stopped: " .. reason)
+	for _, chunk in field.chunks do
+		destroyRender(chunk)
+	end
+end
+
+local function doWork(chunk: Chunk, rs: RenderState)
+	if chunk.stale then
+		chunk.stale = false
+		field:clearGrids(chunk)
+		if chunk.full or rs.wantFull then
+			local grid = field:sampleGrid(chunk, 1, samplerFor(chunk), budget)
+			if alive(chunk) then
+				field:attachFull(chunk, grid, now())
+			end
+		end
+		return
+	end
+
+	local step = rs.wantStep
+	-- something to look at quickly: a coarse mesh first when nothing is drawn yet
+	local quick = step > 1 and not chunk.full and not rs.mesh
+	if rs.wantFull and not chunk.full and not (quick and rs.emptyVersion ~= chunk.gridVersion) then
+		local grid = field:sampleGrid(chunk, 1, samplerFor(chunk), budget)
+		if alive(chunk) and not chunk.full then
+			field:attachFull(chunk, grid, now())
+		end
+		return
+	end
+
+	if step <= 0 then
+		return
+	end
+	if not chunk.full and not chunk.coarse[step] then
+		local grid = field:sampleGrid(chunk, step, samplerFor(chunk), budget)
+		if alive(chunk) then
+			field:attachCoarse(chunk, grid)
+		end
+		return
+	end
+
+	rs.building = true
+	local mesh, reason = ChunkMesh.build(field, chunk, step, style, budget)
+	rs.building = false
+	if not alive(chunk) or stopped then
+		if mesh then
+			mesh:destroy()
+		end
+		return
+	end
+	if mesh then
+		consecutiveErrors = 0
+		local old = rs.mesh
+		rs.mesh = mesh
+		if old then
+			old:destroy()
+		end
+		if mesh.usesFull and chunk.version ~= mesh.version then
+			-- the snow changed while the mesh was being built
+			mesh:applyDirty(field, chunk, nil, true, Config.PackedSnowTint)
+		end
+	elseif reason == "empty" then
+		rs.emptyVersion = chunk.gridVersion
+		rs.emptyStep = step
+		destroyRender(chunk)
+	elseif reason == "budget" then
+		rs.failedUntil = now() + 5
+		if not warnedBudget then
+			warnedBudget = true
+			warn(
+				"[DeformableSnow] this device ran out of EditableMesh memory; far snow will be skipped. "
+					.. "Lower MaxRenderDistance / LodDistances or raise CellSize in Config."
+			)
+		end
+	elseif reason == "error" then
+		consecutiveErrors += 1
+		rs.failedUntil = now() + 2
+		if consecutiveErrors >= 3 then
+			stopAll(
+				"EditableMesh could not be created. For a published game, open the Creator Dashboard and "
+					.. "turn on 'Enable Mesh / Image APIs' for this experience (the owner must be 13+ and ID "
+					.. "verified). In Studio it works without that."
+			)
+		end
+	end
+end
+
+local function workerLoop()
+	while not stopped do
+		local picked: Chunk? = nil
+		local pickedIndex = 0
+		for i, chunk in workList do
+			if alive(chunk) and needsWork(chunk, getState(chunk)) then
+				picked = chunk
+				pickedIndex = i
+				break
+			end
+		end
+		if picked then
+			-- drop everything before it (already done or gone)
+			for _ = 1, pickedIndex - 1 do
+				table.remove(workList, 1)
+			end
+			local target = picked :: Chunk
+			local ok, err = pcall(function()
+				doWork(target, getState(target))
+			end)
+			if not ok then
+				warn("[DeformableSnow] loader error:", err)
+				getState(picked).failedUntil = now() + 3
+				table.remove(workList, 1)
+			end
+			budget()
+		else
+			table.clear(workList)
+			RunService.Heartbeat:Wait()
+			workStart = os.clock()
+		end
+	end
+end
+
+------------------------------------------------------------------------ planning (4x per second)
+local function plan()
+	local t = now()
+	local halfSpan = CHUNK_SPAN * 0.5
+	local list = {}
+	for _, chunk in field.chunks do
+		local rs = getState(chunk)
+		local cxw, czw = field:chunkCenter(chunk)
+		local dx = math.max(math.abs(camPos.X - cxw) - halfSpan, 0)
+		local dz = math.max(math.abs(camPos.Z - czw) - halfSpan, 0)
+		local lo, hi = camPos.Y, camPos.Y
+		local full = chunk.full
+		if full then
+			lo, hi = full.minY, full.maxY
+		else
+			for _, g in chunk.coarse do
+				lo, hi = g.minY, g.maxY
+				break
+			end
+		end
+		local dy = if camPos.Y < lo then lo - camPos.Y elseif camPos.Y > hi then camPos.Y - hi else 0
+		local dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+		-- chunks someone is about to step into jump the queue
+		rs.priority = if not full and (t - chunk.lastNeeded) < 3 then dist - 100000 else dist
+
+		local step
+		if dist > Config.MaxRenderDistance then
+			step = 0
+		elseif dist < LOD1 then
+			step = 1
+		elseif dist < LOD2 then
+			step = 2
+		elseif dist < LOD3 then
+			step = 4
+		else
+			step = 8
+		end
+		rs.wantStep = step
+		rs.wantFull = dist < DATA_DISTANCE or (t - chunk.lastNeeded) < 3
+
+		if step == 0 and rs.mesh and not rs.building then
+			destroyRender(chunk)
+		end
+		if step == 0 and not full then
+			chunk.coarse = {}
+		end
+		-- forget simulations that are far away and fully regrown
+		if full and not rs.wantFull and full.activeCount == 0 and not chunk.stale
+			and dist > DATA_DISTANCE * 1.25 and not rs.building
+		then
+			field:dropFull(chunk)
+		end
+		if needsWork(chunk, rs) then
+			table.insert(list, chunk)
+		end
+	end
+	table.sort(list, function(a: Chunk, b: Chunk)
+		return (a.render :: RenderState).priority < (b.render :: RenderState).priority
+	end)
+	workList = list
+end
+
+------------------------------------------------------------------------ effects
+local fxAttachment: Attachment
+local puffEmitter: ParticleEmitter
+local sparkleEmitter: ParticleEmitter
+local sounds: { Sound } = {}
+local soundAttachments: { Attachment } = {}
+local soundIndex = 0
+
+local function setupEffects()
+	local holder = Instance.new("Part")
+	holder.Name = "SnowFx"
+	holder.Anchored = true
+	holder.CanCollide = false
+	holder.CanQuery = false
+	holder.CanTouch = false
+	holder.Transparency = 1
+	holder.Size = Vector3.new(0.2, 0.2, 0.2)
+	holder.CFrame = CFrame.new()
+	holder.Parent = renderFolder
+
+	fxAttachment = Instance.new("Attachment")
+	fxAttachment.Parent = holder
+
+	puffEmitter = Instance.new("ParticleEmitter")
+	puffEmitter.Name = "Puff"
+	puffEmitter.Enabled = false
+	puffEmitter.Texture = "rbxasset://textures/particles/smoke_main.dds"
+	puffEmitter.Color = ColorSequence.new(Config.SnowColor)
+	puffEmitter.LightEmission = 0.1
+	puffEmitter.LightInfluence = 1
+	puffEmitter.Size = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0.2),
+		NumberSequenceKeypoint.new(1, 0.75),
+	})
+	puffEmitter.Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0.3),
+		NumberSequenceKeypoint.new(1, 1),
+	})
+	puffEmitter.Lifetime = NumberRange.new(0.35, 0.7)
+	puffEmitter.Speed = NumberRange.new(1.5, 4)
+	puffEmitter.SpreadAngle = Vector2.new(70, 70)
+	puffEmitter.EmissionDirection = Enum.NormalId.Top
+	puffEmitter.Acceleration = Vector3.new(0, -14, 0)
+	puffEmitter.Drag = 3
+	puffEmitter.Rotation = NumberRange.new(0, 360)
+	puffEmitter.RotSpeed = NumberRange.new(-120, 120)
+	puffEmitter.Parent = fxAttachment
+
+	sparkleEmitter = Instance.new("ParticleEmitter")
+	sparkleEmitter.Name = "Flakes"
+	sparkleEmitter.Enabled = false
+	sparkleEmitter.Texture = "rbxasset://textures/particles/sparkles_main.dds"
+	sparkleEmitter.Color = ColorSequence.new(Color3.new(1, 1, 1))
+	sparkleEmitter.LightEmission = 0.6
+	sparkleEmitter.Size = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0.12),
+		NumberSequenceKeypoint.new(1, 0.04),
+	})
+	sparkleEmitter.Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0),
+		NumberSequenceKeypoint.new(1, 1),
+	})
+	sparkleEmitter.Lifetime = NumberRange.new(0.5, 0.9)
+	sparkleEmitter.Speed = NumberRange.new(2, 5)
+	sparkleEmitter.SpreadAngle = Vector2.new(60, 60)
+	sparkleEmitter.EmissionDirection = Enum.NormalId.Top
+	sparkleEmitter.Acceleration = Vector3.new(0, -18, 0)
+	sparkleEmitter.Drag = 1.5
+	sparkleEmitter.Parent = fxAttachment
+
+	if Config.FootstepSoundId ~= "" then
+		for i = 1, 4 do
+			local a = Instance.new("Attachment")
+			a.Parent = holder
+			local s = Instance.new("Sound")
+			s.SoundId = Config.FootstepSoundId
+			s.Volume = Config.FootstepSoundVolume
+			s.RollOffMaxDistance = 60
+			s.Parent = a
+			soundAttachments[i] = a
+			sounds[i] = s
+		end
+	end
+end
+
+local function puff(pos: Vector3, volume: number)
+	fxAttachment.WorldPosition = pos
+	puffEmitter:Emit(math.clamp(math.floor(volume * 14 + 0.5), 2, 14))
+	sparkleEmitter:Emit(math.clamp(math.floor(volume * 6 + 0.5), 1, 6))
+end
+
+local function crunch(pos: Vector3, strength: number)
+	if #sounds == 0 then
+		return
+	end
+	soundIndex = soundIndex % #sounds + 1
+	soundAttachments[soundIndex].WorldPosition = pos
+	local s = sounds[soundIndex]
+	s.Volume = Config.FootstepSoundVolume * math.clamp(0.4 + strength, 0.4, 1)
+	s.PlaybackSpeed = 0.9 + math.random() * 0.2
+	s:Play()
+end
+
+------------------------------------------------------------------------ slowdown
+local resist = 0
+local speedApplied: number? = nil
+local speedBase = 16
+local speedHumanoid: Humanoid? = nil
+
+local function applySlowdown(dt: number, framePen: number)
+	local char = localPlayer and localPlayer.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if hum ~= speedHumanoid then
+		speedHumanoid = hum
+		speedApplied = nil
+		resist = 0
+	end
+	if not hum then
+		return
+	end
+	local depth = math.max(Config.SnowDepth, 0.2)
+	local r = math.clamp(framePen / depth, 0, 1)
+	resist = math.max(r, resist * math.exp(-dt / 0.4))
+	local factor = 1 - Config.SlowdownStrength * resist
+
+	if speedApplied == nil or math.abs(hum.WalkSpeed - speedApplied) > 1e-3 then
+		-- first time, or another script changed WalkSpeed: that is the new base
+		if factor >= 0.999 and speedApplied == nil then
+			return
+		end
+		speedBase = hum.WalkSpeed
+	end
+	if factor >= 0.999 then
+		if speedApplied ~= nil then
+			hum.WalkSpeed = speedBase
+			speedApplied = nil
+		end
+		return
+	end
+	local target = speedBase * factor
+	if math.abs(hum.WalkSpeed - target) > 0.01 then
+		hum.WalkSpeed = target
+	end
+	speedApplied = hum.WalkSpeed
+end
+
+------------------------------------------------------------------------ deformers
+local function pressPart(part: BasePart, kind: number, t: number, collect: boolean): boolean
+	local size = part.Size
+	local px, py, pz, r00, r01, r02, r10, r11, r12, r20, r21, r22 = part.CFrame:GetComponents()
+	Shapes.set(shape, kind, px, py, pz, r00, r01, r02, r10, r11, r12, r20, r21, r22, size.X, size.Y, size.Z)
+
+	-- broad phase: is there simulated snow under this shape that reaches up to it?
+	local reach = false
+	local cx0, cx1 = field:chunkRange(shape.minX, shape.maxX)
+	local cz0, cz1 = field:chunkRange(shape.minZ, shape.maxZ)
+	for cz = cz0, cz1 do
+		for cx = cx0, cx1 do
+			local chunk = field:getChunk(cx, cz)
+			if chunk then
+				local full = chunk.full
+				if full then
+					if shape.minY < full.maxY then
+						reach = true
+						chunk.lastNeeded = t
+					end
+				else
+					-- not simulated yet: ask the loader for it if we might touch it
+					local near = true
+					for _, g in chunk.coarse do
+						near = shape.minY < g.maxY + 2
+						break
+					end
+					if near then
+						chunk.lastNeeded = t
+					end
+				end
+			end
+		end
+	end
+	if not reach then
+		return false
+	end
+	if collect then
+		SnowField.resetStats(stats)
+		return field:stamp(shape, 0, t, stats, nil)
+	end
+	return field:stamp(shape, 0, t, nil, nil)
+end
+
+local function refreshCharParts(info: CharInfo)
+	local list, kinds = {}, {}
+	for _, child in info.model:GetChildren() do
+		if child:IsA("BasePart") and child.Name ~= "HumanoidRootPart" then
+			table.insert(list, child)
+			table.insert(kinds, shapeKind(child))
+		end
+	end
+	info.parts = list
+	info.kinds = kinds
+	local root = info.model:FindFirstChild("HumanoidRootPart")
+	info.root = if root and root:IsA("BasePart") then root else info.humanoid.RootPart
+end
+
+local function untrackCharacter(model: Model)
+	local info = characters[model]
+	if not info then
+		return
+	end
+	characters[model] = nil
+	for _, c in info.conns do
+		c:Disconnect()
+	end
+end
+
+local function trackHumanoid(humanoid: Humanoid)
+	if not Config.DeformByCharacters then
+		return
+	end
+	local model = humanoid.Parent
+	if not model or not model:IsA("Model") or characters[model] then
+		return
+	end
+	if snowFolder and model:IsDescendantOf(snowFolder) then
+		return
+	end
+	if hasTagUpTo(model, Config.IgnoreTag, Workspace) then
+		return
+	end
+	local info: CharInfo = {
+		model = model,
+		humanoid = humanoid,
+		root = nil,
+		parts = {},
+		kinds = {},
+		simulated = false,
+		conns = {},
+		fxCooldown = {},
+		lastSent = {},
+	}
+	characters[model] = info
+	refreshCharParts(info)
+	local function refresh()
+		if characters[model] == info then
+			refreshCharParts(info)
+		end
+	end
+	table.insert(info.conns, model.ChildAdded:Connect(refresh))
+	table.insert(info.conns, model.ChildRemoved:Connect(refresh))
+	table.insert(
+		info.conns,
+		model.AncestryChanged:Connect(function()
+			if not model:IsDescendantOf(Workspace) then
+				untrackCharacter(model)
+			end
+		end)
+	)
+	table.insert(
+		info.conns,
+		humanoid.AncestryChanged:Connect(function()
+			if humanoid.Parent ~= model then
+				untrackCharacter(model)
+			end
+		end)
+	)
+end
+
+local function isCharacterPart(part: BasePart): boolean
+	local node: Instance? = part.Parent
+	for _ = 1, 4 do
+		if not node then
+			return false
+		end
+		if node:IsA("Model") and characters[node :: Model] then
+			return true
+		end
+		node = node.Parent
+	end
+	return false
+end
+
+local function addTagged(inst: Instance)
+	local function add(p: BasePart)
+		local d = deformers[p]
+		if d then
+			d.tagged = true
+		else
+			deformers[p] = { kind = shapeKind(p), lastCF = nil, lastSize = nil, lastStamp = 0, lastSeen = math.huge, tagged = true }
+		end
+	end
+	if inst:IsA("BasePart") then
+		add(inst)
+	end
+	for _, d in inst:GetDescendants() do
+		if d:IsA("BasePart") then
+			add(d)
+		end
+	end
+end
+
+local function removeTagged(inst: Instance)
+	local function remove(p: BasePart)
+		local d = deformers[p]
+		if d then
+			d.tagged = false
+			d.lastSeen = now()
+		end
+	end
+	if inst:IsA("BasePart") then
+		remove(inst)
+	end
+	for _, d in inst:GetDescendants() do
+		if d:IsA("BasePart") then
+			remove(d)
+		end
+	end
+end
+
+-- Finds unanchored parts touching simulated snow (5x per second).
+local function scanDynamic(t: number)
+	if not Config.DeformByUnanchoredParts then
+		return
+	end
+	local maxSize = Config.MaxDeformerSize
+	for _, chunk in field.chunks do
+		local full = chunk.full
+		if full and full.snowCount > 0 then
+			local cxw, czw = field:chunkCenter(chunk)
+			local dx, dz = cxw - camPos.X, czw - camPos.Z
+			if dx * dx + dz * dz < SIM_DIST2 then
+				local h = full.maxY - full.minY + 1
+				local found = Workspace:GetPartBoundsInBox(
+					CFrame.new(cxw, (full.minY + full.maxY) * 0.5, czw),
+					Vector3.new(CHUNK_SPAN, h, CHUNK_SPAN),
+					overlapParams
+				)
+				for _, p in found do
+					local d = deformers[p]
+					if d then
+						d.lastSeen = t
+					elseif not p.Anchored and not isCharacterPart(p) then
+						local s = p.Size
+						if math.max(s.X, s.Y, s.Z) <= maxSize and not hasTagUpTo(p, Config.IgnoreTag, Workspace) then
+							deformers[p] = { kind = shapeKind(p), lastCF = nil, lastSize = nil, lastStamp = 0, lastSeen = t, tagged = false }
+						end
+					end
+				end
+			end
+		end
+	end
+end
+
+local function queueOutgoing(part: BasePart, info: CharInfo, kind: number, t: number)
+	if not remote then
+		return
+	end
+	local pos = part.Position
+	local last = info.lastSent[part]
+	if last and t - last.t < 0.1 and (pos - last.pos).Magnitude < 0.3 then
+		return
+	end
+	info.lastSent[part] = { t = t, pos = pos }
+	local size = part.Size
+	local _, _, _, r00, r01, r02, r10, r11, r12, r20, r21, r22 = part.CFrame:GetComponents()
+	table.insert(outbox, {
+		kind = kind,
+		px = pos.X,
+		py = pos.Y,
+		pz = pos.Z,
+		r00 = r00,
+		r01 = r01,
+		r02 = r02,
+		r10 = r10,
+		r11 = r11,
+		r12 = r12,
+		r20 = r20,
+		r21 = r21,
+		r22 = r22,
+		sx = size.X,
+		sy = size.Y,
+		sz = size.Z,
+		userId = 0,
+		time = 0,
+	})
+	if #outbox > 200 then
+		table.remove(outbox, 1)
+	end
+end
+
+-- Where the last press happened, at the top of the untouched snow (for puffs/sounds).
+local function contactPoint(): Vector3
+	local cx, cz = stats.sumX / stats.count, stats.sumZ / stats.count
+	local y = stats.sumY / stats.count
+	local base, rest = field:columnAt(cx, cz)
+	if base and rest > y then
+		y = rest
+	end
+	return Vector3.new(cx, y + 0.1, cz)
+end
+
+local function stepDeformers(t: number, dt: number)
+	local localChar = localPlayer and localPlayer.Character
+	local framePen = 0
+	local areaScale = CELL * CELL
+
+	for model, info in characters do
+		local root = info.root
+		if root and root.Parent then
+			local pos = root.Position
+			local dx, dy, dz = pos.X - camPos.X, pos.Y - camPos.Y, pos.Z - camPos.Z
+			local d2 = dx * dx + dy * dy + dz * dz
+			local isLocal = model == localChar
+			info.simulated = isLocal or d2 < SIM_DIST2
+			if info.simulated then
+				-- warm up the snow around them before they step into it
+				local cx0, cx1 = field:chunkRange(pos.X - 10, pos.X + 10)
+				local cz0, cz1 = field:chunkRange(pos.Z - 10, pos.Z + 10)
+				for cz = cz0, cz1 do
+					for cx = cx0, cx1 do
+						local chunk = field:getChunk(cx, cz)
+						if chunk then
+							local full = chunk.full
+							if not full or pos.Y - 8 < full.maxY then
+								chunk.lastNeeded = t
+							end
+						end
+					end
+				end
+				local nearFx = d2 < FX_DIST2
+				for k, part in info.parts do
+					if part.Parent and pressPart(part, info.kinds[k], t, true) then
+						local vol = stats.volume * areaScale
+						if isLocal then
+							if stats.maxPen > framePen then
+								framePen = stats.maxPen
+							end
+							queueOutgoing(part, info, info.kinds[k], t)
+						end
+						if nearFx and stats.count > 0 and vol > 0.04 then
+							local cd = info.fxCooldown[part]
+							if not cd or t - cd > 0.12 then
+								info.fxCooldown[part] = t
+								local at = contactPoint()
+								if Config.FootstepParticles then
+									puff(at, vol)
+								end
+								if d2 < SOUND_DIST2 then
+									crunch(at, vol)
+								end
+							end
+						end
+					end
+				end
+			end
+		else
+			info.simulated = false
+		end
+	end
+
+	for p, d in deformers do
+		if not p.Parent or (not d.tagged and t - d.lastSeen > 0.6) then
+			deformers[p] = nil
+		else
+			local cf = p.CFrame
+			local size = p.Size
+			-- a resting object only needs re-pressing once a second (keeps its dent from regrowing)
+			if cf ~= d.lastCF or size ~= d.lastSize or t - d.lastStamp > 1 then
+				local pos = cf.Position
+				local dx, dz = pos.X - camPos.X, pos.Z - camPos.Z
+				if dx * dx + dz * dz < SIM_DIST2 then
+					d.lastCF, d.lastSize, d.lastStamp = cf, size, t
+					local collect = Config.FootstepParticles
+					if pressPart(p, d.kind, t, collect) and collect then
+						local vol = stats.volume * areaScale
+						if vol > 0.08 and stats.count > 0 and dx * dx + dz * dz < FX_DIST2 then
+							puff(contactPoint(), math.min(vol, 1))
+						end
+					end
+				end
+			end
+		end
+	end
+
+	if Config.SlowdownInDeepSnow then
+		applySlowdown(dt, framePen)
+	end
+end
+
+------------------------------------------------------------------------ mesh updates
+-- Flags a neighbour chunk's border vertex for a normal refresh (its shading depends on our columns).
+local function pokeNeighbor(chunk: Chunk, dcx: number, dcz: number, ni: number)
+	local nb = field:getChunk(chunk.cx + dcx, chunk.cz + dcz)
+	if nb and nb.full and nb.render and nb.dirty[ni] == nil then
+		nb.dirty[ni] = 2
+		nb.dirtyCount += 1
+	end
+end
+
+local function flushMeshes()
+	local C = CHUNK_CELLS
+	local n = C + 1
+	local tint = Config.PackedSnowTint
+	for _, chunk in field.chunks do
+		if chunk.dirtyCount > 0 then
+			local dirty = chunk.dirty
+			chunk.dirty = {}
+			chunk.dirtyCount = 0
+			local rs = chunk.render :: RenderState?
+			local mesh = rs and rs.mesh
+			if mesh and mesh.usesFull then
+				mesh:applyDirty(field, chunk, dirty, false, tint)
+			end
+			for i, flag in dirty do
+				if flag == 1 then
+					local lx, lz = i % n, i // n
+					if lx > 0 and lx <= 8 then
+						pokeNeighbor(chunk, -1, 0, lz * n + C)
+					elseif lx < C and lx >= C - 8 then
+						pokeNeighbor(chunk, 1, 0, lz * n)
+					end
+					if lz > 0 and lz <= 8 then
+						pokeNeighbor(chunk, 0, -1, C * n + lx)
+					elseif lz < C and lz >= C - 8 then
+						pokeNeighbor(chunk, 0, 1, lx)
+					end
+				end
+			end
+		end
+	end
+end
+
+local function stepRegrow(t: number)
+	if Config.RegrowSpeed <= 0 then
+		return
+	end
+	for _, chunk in field.chunks do
+		local full = chunk.full
+		if full and full.activeCount > 0 and t - full.lastRegrow >= 0.25 then
+			field:regrow(chunk, t)
+		end
+	end
+end
+
+------------------------------------------------------------------------ networking
+local function maxPrintAge(): number?
+	if Config.RegrowSpeed <= 0 then
+		return nil
+	end
+	local deepest = Config.SnowDepth
+	for _, info in parts do
+		if info.depth > deepest then
+			deepest = info.depth
+		end
+	end
+	return Config.RegrowDelay + deepest * (1 + Config.RimRatio) / Config.RegrowSpeed + 1
+end
+
+local function isSimulatedLocally(userId: number): boolean
+	local plr = Players:GetPlayerByUserId(userId)
+	local char = plr and plr.Character
+	local info = char and characters[char]
+	return info ~= nil and info.simulated
+end
+
+local function onRemote(kind: any, payload: any)
+	if stopped or (kind ~= "relay" and kind ~= "history") then
+		return
+	end
+	local list = StampCodec.decodeRelay(payload)
+	if not list then
+		return
+	end
+	local serverNow = Workspace:GetServerTimeNow()
+	local t = now()
+	local maxAge = maxPrintAge()
+	local myId = localPlayer and localPlayer.UserId or 0
+	for _, s in list do
+		if kind == "relay" and (s.userId == myId or isSimulatedLocally(s.userId)) then
+			continue
+		end
+		local age = math.max(0, serverNow - s.time)
+		if maxAge and age > maxAge then
+			continue
+		end
+		local sh = Shapes.new()
+		Shapes.set(sh, s.kind, s.px, s.py, s.pz, s.r00, s.r01, s.r02, s.r10, s.r11, s.r12, s.r20, s.r21, s.r22, s.sx, s.sy, s.sz)
+		field:queueStamp(sh, t, t - age)
+	end
+end
+
+local function connectRemote()
+	if not Config.SyncFootprints then
+		return
+	end
+	local folder = ReplicatedStorage:WaitForChild("DeformableSnowRemotes", 30)
+	if not folder then
+		warn("[DeformableSnow] server script not found - footprints are not shared with late joiners")
+		return
+	end
+	local ev = folder:WaitForChild("Footprints", 10)
+	if not ev or not ev:IsA("RemoteEvent") then
+		return
+	end
+	ev.OnClientEvent:Connect(onRemote)
+	remote = ev
+	-- ask for the history only once our snow parts are known (prints need chunks to land in)
+	while not partsReady and not stopped do
+		task.wait(0.1)
+	end
+	ev:FireServer("hello")
+end
+
+local function flushOutbox()
+	local ev = remote
+	if ev and #outbox > 0 then
+		local packet = StampCodec.encodeClient(outbox)
+		table.clear(outbox)
+		ev:FireServer(packet)
+	end
+end
+
+------------------------------------------------------------------------ start
+function SnowClient.start()
+	if (shared :: any).__DeformableSnowClient then
+		warn("[DeformableSnow] client already running (is the folder in two places?)")
+		return
+	end
+	(shared :: any).__DeformableSnowClient = true
+
+	field = SnowField.new({
+		cellSize = CELL,
+		chunkCells = CHUNK_CELLS,
+		edgeFalloff = math.max(0, Config.EdgeFalloff),
+		minThickness = math.max(0.01, Config.MinThickness),
+		cliffHeight = math.max(0.5, Config.CliffHeight),
+		maxSlopeCos = math.cos(math.rad(math.clamp(Config.MaxSlopeAngle, 1, 89))),
+		rimRatio = math.max(0, Config.RimRatio),
+		rimWidth = math.max(0.01, Config.RimWidth),
+		regrowDelay = math.max(0, Config.RegrowDelay),
+		regrowSpeed = math.max(0, Config.RegrowSpeed),
+		maxPendingPerChunk = 2000,
+	})
+
+	local folder = Instance.new("Folder")
+	folder.Name = "DeformableSnowRender"
+	folder.Parent = Workspace
+	renderFolder = folder
+
+	style = {
+		color = Config.SnowColor,
+		packedTint = Config.PackedSnowTint,
+		material = Config.Material,
+		materialVariant = Config.MaterialVariant,
+		studsPerTile = math.max(0.5, Config.TextureStudsPerTile),
+		castShadow = Config.CastShadow,
+		parent = renderFolder,
+	}
+	setupEffects()
+
+	-- snow parts
+	task.spawn(function()
+		local f = Workspace:WaitForChild(Config.SnowFolderName, 10)
+		if not f then
+			warn(`[DeformableSnow] waiting for Workspace.{Config.SnowFolderName} (put your snow parts in it)`)
+			f = Workspace:WaitForChild(Config.SnowFolderName)
+		end
+		local sf = f :: Instance
+		snowFolder = sf
+		overlapParams.FilterDescendantsInstances = { renderFolder, sf }
+		for _, d in sf:GetDescendants() do
+			if d:IsA("BasePart") then
+				trackPart(d)
+			end
+		end
+		partsReady = true
+		sf.DescendantAdded:Connect(function(d)
+			if d:IsA("BasePart") then
+				trackPart(d)
+			end
+		end)
+		sf.DescendantRemoving:Connect(function(d)
+			if d:IsA("BasePart") then
+				untrackPart(d)
+			end
+		end)
+		CollectionService:GetInstanceAddedSignal(Config.IgnoreTag):Connect(function(inst: Instance)
+			if inst:IsA("BasePart") then
+				untrackPart(inst)
+			end
+			for _, d in inst:GetDescendants() do
+				if d:IsA("BasePart") then
+					untrackPart(d)
+				end
+			end
+		end)
+		CollectionService:GetInstanceRemovedSignal(Config.IgnoreTag):Connect(function(inst: Instance)
+			if not inst:IsDescendantOf(sf) then
+				return
+			end
+			if inst:IsA("BasePart") then
+				trackPart(inst)
+			end
+			for _, d in inst:GetDescendants() do
+				if d:IsA("BasePart") then
+					trackPart(d)
+				end
+			end
+		end)
+	end)
+
+	-- characters & NPCs
+	for _, d in Workspace:GetDescendants() do
+		if d:IsA("Humanoid") then
+			trackHumanoid(d)
+		end
+	end
+	Workspace.DescendantAdded:Connect(function(d)
+		if d:IsA("Humanoid") then
+			task.defer(trackHumanoid, d)
+		end
+	end)
+
+	-- tagged deformers
+	for _, inst in CollectionService:GetTagged(Config.DeformerTag) do
+		addTagged(inst)
+	end
+	CollectionService:GetInstanceAddedSignal(Config.DeformerTag):Connect(addTagged)
+	CollectionService:GetInstanceRemovedSignal(Config.DeformerTag):Connect(removeTagged)
+
+	task.spawn(connectRemote)
+	task.spawn(workerLoop)
+
+	local planTimer, scanTimer, sendTimer, debugTimer = 0, 0, 0, 0
+	local lastError: string? = nil
+	-- runs one piece of the frame update; an unexpected error is reported once instead of every frame
+	local function protected(fn: (...any) -> (), ...: any)
+		local ok, err = pcall(fn :: any, ...)
+		if not ok and tostring(err) ~= lastError then
+			lastError = tostring(err)
+			warn("[DeformableSnow] " .. tostring(err))
+		end
+	end
+
+	RunService.Heartbeat:Connect(function(dt: number)
+		if stopped then
+			return
+		end
+		local t = now()
+		local cam = Workspace.CurrentCamera
+		if cam then
+			camPos = cam.CFrame.Position
+		end
+
+		protected(stepDeformers, t, dt)
+		protected(stepRegrow, t)
+		protected(flushMeshes)
+
+		planTimer += dt
+		if planTimer >= 0.25 then
+			planTimer = 0
+			protected(processRefreshQueue)
+			protected(plan)
+		end
+		scanTimer += dt
+		if scanTimer >= 0.2 then
+			scanTimer = 0
+			protected(scanDynamic, t)
+		end
+		sendTimer += dt
+		if sendTimer >= 0.25 then
+			sendTimer = 0
+			protected(flushOutbox)
+		end
+		if Config.Debug then
+			debugTimer += dt
+			if debugTimer >= 5 then
+				debugTimer = 0
+				local nChunks, nFull, nMesh, nActive = 0, 0, 0, 0
+				for _, chunk in field.chunks do
+					nChunks += 1
+					if chunk.full then
+						nFull += 1
+						nActive += chunk.full.activeCount
+					end
+					local rs = chunk.render :: RenderState?
+					if rs and rs.mesh then
+						nMesh += 1
+					end
+				end
+				local nParts = 0
+				for _ in parts do
+					nParts += 1
+				end
+				print(
+					`[DeformableSnow] parts={nParts} chunks={nChunks} simulated={nFull} meshes={nMesh} `
+						.. `regrowing={nActive} queue={#workList}`
+				)
+			end
+		end
+	end)
+end
+
+return SnowClient
+]]></ProtectedString>
+			</Properties>
+		</Item>
+		<Item class="ModuleScript" referent="RBX41248F5F31684CFCBB6768F7532FBEC6">
+			<Properties>
+				<string name="Name">SnowServer</string>
+				<ProtectedString name="Source"><![CDATA[--!strict
+--[[
+	SnowServer
+	Optional helper that makes footprints shared:
+	  * every client reports the prints its own character makes (compact buffers)
+	  * the server validates them (rate limit, must be near that player's character), keeps a
+	    rolling history and relays them to everybody
+	  * players who join later receive the history, so existing trails are already there
+	The snow itself is simulated on each client; the server never touches any meshes.
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+
+local Config = require(script.Parent.Config)
+local StampCodec = require(script.Parent.StampCodec)
+
+local SnowServer = {}
+
+local RATE = 60 -- prints per second a player may report (sustained)
+local BURST = 120
+local MAX_DIST = 25 -- a print must be this close to the reporting player's character
+local RELAY_INTERVAL = 0.25
+
+function SnowServer.start()
+	if (shared :: any).__DeformableSnowServer then
+		return
+	end
+	(shared :: any).__DeformableSnowServer = true
+	if not Config.SyncFootprints then
+		return
+	end
+
+	local folder = ReplicatedStorage:FindFirstChild("DeformableSnowRemotes")
+	if not folder then
+		folder = Instance.new("Folder")
+		folder.Name = "DeformableSnowRemotes"
+	end
+	local ev = (folder :: Instance):FindFirstChild("Footprints") :: RemoteEvent?
+	if not ev then
+		local created = Instance.new("RemoteEvent")
+		created.Name = "Footprints"
+		created.Parent = folder
+		ev = created
+	end
+	local remote = ev :: RemoteEvent
+	;(folder :: Instance).Parent = ReplicatedStorage
+
+	local history: { StampCodec.Stamp } = {}
+	local pending: { StampCodec.Stamp } = {}
+	local tokens: { [Player]: number } = {}
+	local refilled: { [Player]: number } = {}
+	local greeted: { [Player]: boolean } = {}
+
+	-- prints older than this have fully regrown and are not worth sending
+	local maxAge = math.huge
+	if Config.RegrowSpeed > 0 then
+		maxAge = Config.RegrowDelay + math.max(Config.SnowDepth, 2) * 3 / Config.RegrowSpeed
+	end
+
+	local function prune(t: number)
+		local n = #history
+		local cut = 0
+		for i = 1, n do
+			if t - history[i].time > maxAge then
+				cut = i
+			else
+				break
+			end
+		end
+		local over = n - Config.MaxHistory
+		if over > cut then
+			cut = over
+		end
+		if cut > 0 then
+			table.move(history, cut + 1, n, 1)
+			for i = n - cut + 1, n do
+				history[i] = nil
+			end
+		end
+	end
+
+	local function sendHistory(player: Player)
+		prune(Workspace:GetServerTimeNow())
+		local snapshot = table.clone(history)
+		local per = StampCodec.MAX_PER_PACKET
+		for i = 1, #snapshot, per do
+			if player.Parent ~= Players then
+				return
+			end
+			remote:FireClient(player, "history", StampCodec.encodeRelay(snapshot, i, i + per - 1))
+			task.wait(0.2)
+		end
+	end
+
+	remote.OnServerEvent:Connect(function(player: Player, payload: any)
+		if payload == "hello" then
+			if not greeted[player] then
+				greeted[player] = true
+				task.spawn(sendHistory, player)
+			end
+			return
+		end
+		local t = Workspace:GetServerTimeNow()
+		local list = StampCodec.decodeClient(payload, player.UserId, t)
+		if not list then
+			return
+		end
+
+		local clock = os.clock()
+		local tk = math.min(BURST, (tokens[player] or BURST) + (clock - (refilled[player] or clock)) * RATE)
+		refilled[player] = clock
+
+		local char = player.Character
+		local root = char and char:FindFirstChild("HumanoidRootPart")
+		if root and root:IsA("BasePart") then
+			local rp = root.Position
+			for _, s in list do
+				if tk < 1 then
+					break
+				end
+				tk -= 1
+				local dx, dy, dz = s.px - rp.X, s.py - rp.Y, s.pz - rp.Z
+				if dx * dx + dy * dy + dz * dz <= MAX_DIST * MAX_DIST then
+					table.insert(history, s)
+					table.insert(pending, s)
+				end
+			end
+		end
+		tokens[player] = tk
+	end)
+
+	Players.PlayerRemoving:Connect(function(player)
+		tokens[player] = nil
+		refilled[player] = nil
+		greeted[player] = nil
+	end)
+
+	local timer = 0
+	RunService.Heartbeat:Connect(function(dt: number)
+		timer += dt
+		if timer < RELAY_INTERVAL then
+			return
+		end
+		timer = 0
+		if #pending > 0 then
+			local per = StampCodec.MAX_PER_PACKET
+			for i = 1, #pending, per do
+				remote:FireAllClients("relay", StampCodec.encodeRelay(pending, i, i + per - 1))
+			end
+			table.clear(pending)
+		end
+		if #history > Config.MaxHistory then
+			prune(Workspace:GetServerTimeNow())
+		end
+	end)
+
+	task.spawn(function()
+		while true do
+			task.wait(10)
+			prune(Workspace:GetServerTimeNow())
+		end
+	end)
+end
+
+return SnowServer
+]]></ProtectedString>
+			</Properties>
+		</Item>
+		<Item class="Script" referent="RBX86F281D399BA4E7992E0FA2CE7E3CCD4">
+			<Properties>
+				<string name="Name">ClientMain</string>
+				<token name="RunContext">2</token>
+				<bool name="Disabled">false</bool>
+				<ProtectedString name="Source"><![CDATA[--!strict
+-- Script with RunContext = Client: runs once on every player's device.
+-- Keep this whole "DeformableSnow" folder in ReplicatedStorage.
+require(script.Parent:WaitForChild("SnowClient")).start()
+]]></ProtectedString>
+			</Properties>
+		</Item>
+		<Item class="Script" referent="RBXABF0809D010E47AF8E55701EBC85C31F">
+			<Properties>
+				<string name="Name">ServerMain</string>
+				<token name="RunContext">1</token>
+				<bool name="Disabled">false</bool>
+				<ProtectedString name="Source"><![CDATA[--!strict
+-- Script with RunContext = Server: shares footprints so late joiners see existing trails.
+require(script.Parent:WaitForChild("SnowServer")).start()
+]]></ProtectedString>
+			</Properties>
+		</Item>
+	</Item>
+</roblox>

@@ -1,0 +1,12 @@
+{
+  "name": "DeformableSnow",
+  "emitLegacyScripts": false,
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "DeformableSnow": {
+        "$path": "src/DeformableSnow"
+      }
+    }
+  }
+}

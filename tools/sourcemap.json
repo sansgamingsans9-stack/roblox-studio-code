@@ -1,0 +1,15 @@
+{"name":"Game","className":"DataModel","children":[
+ {"name":"ReplicatedStorage","className":"ReplicatedStorage","children":[
+  {"name":"DeformableSnow","className":"Folder","children":[
+   {"name":"Config","className":"ModuleScript","filePaths":["src/DeformableSnow/Config.luau"]},
+   {"name":"Shapes","className":"ModuleScript","filePaths":["src/DeformableSnow/Shapes.luau"]},
+   {"name":"SnowField","className":"ModuleScript","filePaths":["src/DeformableSnow/SnowField.luau"]},
+   {"name":"StampCodec","className":"ModuleScript","filePaths":["src/DeformableSnow/StampCodec.luau"]},
+   {"name":"ChunkMesh","className":"ModuleScript","filePaths":["src/DeformableSnow/ChunkMesh.luau"]},
+   {"name":"SnowClient","className":"ModuleScript","filePaths":["src/DeformableSnow/SnowClient.luau"]},
+   {"name":"SnowServer","className":"ModuleScript","filePaths":["src/DeformableSnow/SnowServer.luau"]},
+   {"name":"ClientMain","className":"Script","filePaths":["src/DeformableSnow/ClientMain.client.luau"]},
+   {"name":"ServerMain","className":"Script","filePaths":["src/DeformableSnow/ServerMain.server.luau"]}
+  ]}
+ ]}
+]}
