@@ -227,6 +227,54 @@ T.describe("edge of the snow", function()
 	r:destroy()
 end)
 
+T.describe("snow on parts at different heights", function()
+	-- two flat parts side by side, the right one 1.5 studs higher
+	local steps = function(x, _z)
+		return if x < 6.1 then 5 else 6.5
+	end
+	local function wedgesOf(r)
+		local n = 0
+		for _, p in r.folder:GetChildren() do
+			if p.ClassName == "WedgePart" then
+				n += 1
+			end
+		end
+		return n
+	end
+	for _, step in { 1, 2 } do
+		local r = build(steps, step)
+		T.eq(wedgesOf(r), 0, `step {step}: untouched snow is drawn with boxes only`)
+		-- boxes merge within a tile (16 x 16 cells): one per level tile, three where the step is
+		local tiles = (16 / step) ^ 2
+		local stepTiles = 16 / step
+		local n = #r.folder:GetChildren()
+		T.ok(n <= tiles + 2 * stepTiles, `step {step}: a box per level and tile ({n})`)
+		T.near(surfaceAt(r, 3, 8), 6, 1e-6, `step {step}: lower snow`)
+		T.near(surfaceAt(r, 10, 8), 7.5, 1e-6, `step {step}: upper snow`)
+		-- the upper snow reaches at most one cell past its part's edge
+		local cell = 0.25 * step
+		T.near(surfaceAt(r, 6.1 - cell - 0.01, 8), 6, 1e-6, `step {step}: clean step next to the edge`)
+		T.near(surfaceAt(r, 6.11, 8), 7.5, 1e-6, `step {step}: upper snow covers its part to the edge`)
+		r:destroy()
+	end
+	-- at coarse detail the step stays a slope (big box cells would shift the edge)
+	local r = build(steps, 4)
+	T.ok(wedgesOf(r) > 0, "coarse detail: triangles")
+	T.near(surfaceAt(r, 3, 8), 6, 1e-6, "coarse: lower snow")
+	T.near(surfaceAt(r, 10, 8), 7.5, 1e-6, "coarse: upper snow")
+	r:destroy()
+
+	-- taller than CliffHeight: never bridged by a wall of snow
+	local cliffy = function(x, _z)
+		return if x < 6.1 then 5 else 9
+	end
+	r = build(cliffy, 1)
+	local mid = surfaceAt(r, 6.12, 8)
+	T.ok(mid == nil or mid < 7, `cliff not bridged ({mid})`)
+	T.near(surfaceAt(r, 12, 8), 10, 1e-6, "snow on top of the cliff")
+	r:destroy()
+end)
+
 T.describe("pool bookkeeping", function()
 	T.eq(ChunkParts.liveCount, 0, "every Part returned to the pool after destroy")
 end)

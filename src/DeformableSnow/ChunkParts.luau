@@ -31,6 +31,10 @@ local THICK = 0.12 -- wedge thickness, hidden below the surface (covers hairline
 local NUDGE = 0.0013 -- keeps box sides off the (round) coordinates of part sides: no flicker
 local MIN_HEIGHT = 0.05
 local REST_EPS = 1e-3
+-- untouched tiles with at most this many flat snow levels (snow on parts at different heights) are
+-- drawn with boxes, the steps between levels become clean vertical edges, instead of a strip of
+-- triangles along every edge; more levels means a slope: triangles
+local MAX_LEVELS = 3
 local LEVELS = 6 -- shades between fresh and fully packed snow
 local POOL_MAX = 6000
 local NO_KEY = math.huge
@@ -464,14 +468,20 @@ end
 	Reads the tile's samples into the scratch arrays. Returns the sample grid size and whether the
 	tile has any snow, any pressed/raised snow, and only level untouched snow.
 ]]
-local function gather(self: ChunkParts, src: Source, ti: number, tj: number): (number, boolean, boolean, boolean)
+--[[
+	Reads one tile's samples into the scratch arrays. Returns the grid size, whether there is any
+	snow, whether any of it is pressed, and how many snow levels it has (MAX_LEVELS + 1 = more).
+]]
+local levelKeys: { number } = {}
+local function gather(self: ChunkParts, src: Source, ti: number, tj: number): (number, boolean, boolean, number)
 	local g = self.tileCells + 1
 	local i0, j0 = ti * self.tileCells, tj * self.tileCells
 	local stride, n = src.stride, src.n
 	local nS = self.nSide + 1
 	local keyCache = self.sampleKey
 	local any, deformed = false, false
-	local restLo, restHi = math.huge, -math.huge
+	-- the distinct snow levels of the tile (rounded like drawn heights), up to MAX_LEVELS
+	local nLevels = 0
 	for y = 0, g - 1 do
 		local cj = j0 + y
 		local rowO = cj * stride * n
@@ -493,11 +503,19 @@ local function gather(self: ChunkParts, src: Source, ti: number, tj: number): (n
 				if math.abs(cur - rest) > REST_EPS then
 					deformed = true
 				end
-				if rest < restLo then
-					restLo = rest
-				end
-				if rest > restHi then
-					restHi = rest
+				if nLevels <= MAX_LEVELS then
+					local rk = math.floor(rest / Q + 0.5)
+					local known = false
+					for k = 1, nLevels do
+						if levelKeys[k] == rk then
+							known = true
+							break
+						end
+					end
+					if not known then
+						nLevels += 1
+						levelKeys[nLevels] = rk
+					end
 				end
 			else
 				sSnow[idx] = false
@@ -506,7 +524,7 @@ local function gather(self: ChunkParts, src: Source, ti: number, tj: number): (n
 			end
 		end
 	end
-	return g, any, deformed, restHi - restLo <= REST_EPS
+	return g, any, deformed, nLevels
 end
 
 -- scratch for the box greedy merge
@@ -524,8 +542,18 @@ local function buildBoxes(self: ChunkParts, tile: Tile, g: number, ti: number, t
 			local i00 = y * g + x + 1
 			local i10, i01, i11 = i00 + 1, i00 + g, i00 + g + 1
 			if sSnow[i00] and sSnow[i10] and sSnow[i01] and sSnow[i11] then
-				cellKey[c] = math.max(sKey[i00], sKey[i10], sKey[i01], sKey[i11])
-				cellBase[c] = math.min(sBase[i00], sBase[i10], sBase[i01], sBase[i11])
+				local hi = math.max(sKey[i00], sKey[i10], sKey[i01], sKey[i11])
+				local lo = math.min(sKey[i00], sKey[i10], sKey[i01], sKey[i11])
+				local bLo = math.min(sBase[i00], sBase[i10], sBase[i01], sBase[i11])
+				local bHi = math.max(sBase[i00], sBase[i10], sBase[i01], sBase[i11])
+				if bHi - bLo > self.cliff then
+					cellKey[c] = false -- a cliff: never bridged (like the triangles)
+				else
+					-- a cell between two levels is drawn at the upper one (a clean step) and
+					-- never merges with flat cells, whose boxes stay as shallow as their ground
+					cellKey[c] = hi * 2 + (if hi ~= lo then 1 else 0)
+					cellBase[c] = bLo
+				end
 			else
 				cellKey[c] = false
 			end
@@ -607,7 +635,7 @@ local function buildBoxes(self: ChunkParts, tile: Tile, g: number, ti: number, t
 		local o = r * 6
 		local rx, ry, rw, rh, key, minB =
 			rects[o + 1], rects[o + 2], rects[o + 3], rects[o + 4], rects[o + 5], rects[o + 6]
-		local top = key * Q
+		local top = (key // 2) * Q
 		local bottom = minB - SINK
 		if top - bottom < MIN_HEIGHT then
 			bottom = top - MIN_HEIGHT
@@ -767,12 +795,14 @@ local function rebuildTile(self: ChunkParts, src: Source, ti: number, tj: number
 		tile = newTile()
 		self.tiles[index] = tile
 	end
-	local g, any, deformed, level = gather(self, src, ti, tj)
+	local g, any, deformed, levels = gather(self, src, ti, tj)
 	if not any then
 		releaseBoxes(self, tile)
 		releaseTris(self, tile)
 		tile.kind = 0
-	elseif level and not deformed then
+	elseif not deformed and (levels <= 1 or (levels <= MAX_LEVELS and self.step <= 2)) then
+		-- untouched snow: boxes. Steps between levels are drawn up to one cell past the higher
+		-- part's edge, so only at fine detail (at coarse detail that would show)
 		releaseTris(self, tile)
 		tile.kind = 1
 		buildBoxes(self, tile, g, ti, tj)

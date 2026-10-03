@@ -154,7 +154,7 @@ function Quality.newMonitor(tier: number, maxTier: number, fixed: boolean): Moni
 		cooldown = 0,
 		warmup = 5, -- loading hitches at the start do not count
 		upNeed = 20,
-		lastUp = -math.huge,
+		lastUp = math.huge, -- seconds since the last step up (never)
 	}
 end
 
@@ -166,7 +166,9 @@ function Quality.step(m: Monitor, dt: number): number?
 	if m.fixed then
 		return nil
 	end
-	dt = math.clamp(dt, 0, 0.5)
+	-- one long hitch (an asset loading, a lag spike) counts like a single 10 FPS frame: only
+	-- slowness that lasts may lower the quality
+	dt = math.clamp(dt, 0, 0.1)
 	m.lastUp += dt
 	if m.warmup > 0 then
 		m.warmup -= dt

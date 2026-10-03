@@ -716,8 +716,8 @@ local overBudget = false
 local cappedFor = 0 -- seconds the budget has been reducing detail in a row
 
 -- Parts renderer budget: nearest chunks first; once the estimated number of snow Parts passes
--- MaxSnowParts, farther chunks get coarser detail, and finally none. Snow closer than NEAR_KEEP
--- studs is never reduced. Hysteresis keeps it from flapping.
+-- MaxSnowParts, farther chunks get coarser detail, and beyond the last detail ring none. Snow
+-- closer than NEAR_KEEP studs is never reduced. Hysteresis keeps it from flapping.
 local function applyPartBudget(all: { Chunk })
 	table.sort(all, function(a: Chunk, b: Chunk)
 		return (a.render :: RenderState).dist < (b.render :: RenderState).dist
@@ -745,7 +745,8 @@ local function applyPartBudget(all: { Chunk })
 					want *= 2
 					est = math.max(1, est / 4)
 				end
-				if used + est > cap and not (rs.emptyVersion == chunk.gridVersion) then
+				-- only far snow may be left out entirely: a missing chunk nearby looks like a hole
+				if used + est > cap and rs.dist >= LOD3 and not (rs.emptyVersion == chunk.gridVersion) then
 					want = 0
 				end
 			end
