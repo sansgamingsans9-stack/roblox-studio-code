@@ -1,7 +1,11 @@
 # ❄️ DeformableSnow (Roblox)
 
 Real, deformable snow for Roblox Studio. Everything inside **`Workspace.SnowParts`** gets a layer of
-soft snow on top. Anything that walks, rolls or drives through it presses it down:
+soft snow on top. Anything that walks, rolls or drives through it presses it down.
+
+**No ID verification needed.** By default the snow is drawn with ordinary Parts, so it works in
+every published game with no special settings. (A smoother `EditableMesh` renderer is optional,
+see [Renderers](#renderers).)
 
 - **Any part type.** Part, MeshPart, Union, Wedge, Cylinder, Ball, inside Models or Folders at any depth.
 - **Collidable or not.**
@@ -22,8 +26,8 @@ soft snow on top. Anything that walks, rolls or drives through it presses it dow
 - **Multiplayer.** Everyone sees everyone's prints. Players who join later still see the existing
   trails (the server keeps a short history).
 - **Fast.** The world is split into chunks with 4 levels of detail and loaded in the background
-  within a per-frame time budget. Only the vertices that actually change are re-uploaded, using the
-  `EditableMesh` batch API.
+  within a per-frame time budget. Flat untouched snow is merged into big boxes (an untouched
+  16×16-stud chunk is one Part), and only the boxes that actually change are updated.
 
 ## Install (2 minutes)
 
@@ -40,24 +44,32 @@ That's it: one folder, no other setup. It contains:
 | `ClientMain` | Script, **RunContext = Client**. Runs on every player's device. |
 | `ServerMain` | Script, **RunContext = Server**. Shares footprints for late joiners. |
 | `Config` | All the settings, documented. Edit this. |
-| `SnowClient`, `SnowField`, `ChunkMesh`, `Shapes`, `StampCodec`, `SnowServer` | The system. |
+| `SnowClient`, `SnowField`, `ChunkParts`, `ChunkMesh`, `Shapes`, `StampCodec`, `SnowServer` | The system. |
 
-> **Publishing:** the snow is drawn with Roblox's `EditableMesh`. In Studio it just works. For a
-> **published** game, Roblox requires the experience owner to be **13+ and ID-verified**. Then open
-> the **Creator Dashboard** and turn on **"Enable Mesh / Image APIs"** for the experience. If it's
-> off, the script prints one warning explaining this, and your parts look normal (no snow layer).
+> **Publishing:** nothing to do. The default `Parts` renderer uses only normal Parts, so it works
+> in published games without ID verification or any experience setting.
 
 Using Rojo instead? `default.project.json` maps `src/DeformableSnow` to
 `ReplicatedStorage.DeformableSnow` (with `emitLegacyScripts: false`, so the `.client`/`.server`
 files become RunContext scripts).
+
+## Renderers
+
+| `Config.Renderer` | Looks | Needs |
+| --- | --- | --- |
+| `"Parts"` (default) | Snow made of merged boxes; prints have crisp, steep walls and flat floors. Slopes look terraced. | Nothing. Works everywhere. |
+| `"EditableMesh"` | Smooth mesh surface with smooth slopes. | In published games, an owner who is 13+ and ID-verified, with **"Enable Mesh / Image APIs"** turned on in the Creator Dashboard. If it's blocked, the system switches to `"Parts"` by itself and prints one warning. |
 
 ## Settings (`Config`)
 
 | Setting | Default | What it does |
 | --- | --- | --- |
 | `SnowFolderName` | `"SnowParts"` | Folder in Workspace that holds the snow parts |
+| `Renderer` | `"Parts"` | `"Parts"` or `"EditableMesh"` (see [Renderers](#renderers)) |
+| `PartsHeightStep` | `0.04` | Parts renderer: heights are rounded to this so flat snow merges into big boxes |
+| `MaxSnowParts` | `12000` | Parts renderer: no new far-away chunks are drawn above this many snow Parts |
 | `SnowDepth` | `1.0` | Studs of snow on top of each part |
-| `CellSize` | `0.5` | Grid spacing. Smaller means sharper prints but more memory. `0.25`–`1` |
+| `CellSize` | `0.25` | Grid spacing. Smaller means sharper prints but more Parts/memory. `0.2`–`1` |
 | `EdgeFalloff` | `1.5` | Snow thins out over this distance at the edges |
 | `MaxSlopeAngle` | `60` | Steeper surfaces hold no snow |
 | `CliffHeight` | `3` | Bigger height jumps are treated as edges (snow doesn't drape off roofs) |
@@ -100,11 +112,14 @@ files become RunContext scripts).
    sphere or cylinder). For every snow column under it, the system finds the shape's lowest point on
    that vertical line and pushes the snow down to there (never below the ground). A rim is pushed up
    around the print.
-4. **Drawing.** Each 32×32-stud chunk is an `EditableMesh` shown through
-   `AssetService:CreateMeshPartAsync`. Other details:
-   - Normals are computed from the heightfield, so shading is seamless across chunks.
-   - Thin "skirts" hide cracks between chunks at different detail levels.
-   - Two sub-pixel triangles pin each mesh's bounding box, so the mesh never shifts while it deforms.
+4. **Drawing.** Each 16×16-stud chunk is drawn by one of two renderers:
+   - **Parts** (default): every snow column is a square cell. Neighbouring cells at the same height
+     and tint merge into one box (greedy meshing), per 4×4-stud tile. A change only rebuilds the
+     tiles it touched, unchanged boxes are never written to, and Parts are pooled and reused.
+     Chunks at different detail levels tile without gaps, and boxes never overlap.
+   - **EditableMesh**: one mesh per chunk shown through `AssetService:CreateMeshPartAsync`. Normals
+     come from the heightfield (seamless shading), thin "skirts" hide cracks between detail levels,
+     and two sub-pixel triangles pin each mesh's bounding box so it never shifts while it deforms.
 5. **Networking.** Each client simulates the snow itself, from the characters it can see. Your own
    prints are also sent to the server in compact buffers. The server validates them: it rate-limits
    them and checks they're near your character. It keeps a rolling history and relays it, so late
@@ -119,17 +134,20 @@ files become RunContext scripts).
 - Snow parts are meant to be mostly static. Moving or resizing one works, but the snow around it is
   re-read.
 - MeshPart wheels are treated as boxes. Use Part cylinders for perfect ruts.
-- On low-memory devices, Roblox may refuse more editable meshes. The system then skips far chunks
-  and warns once. Lower `MaxRenderDistance` or raise `CellSize` if you see that warning.
+- Parts renderer: snow on slopes looks terraced (stair-stepped), and prints have pixel-stepped
+  outlines at `CellSize` resolution. Lower `CellSize` for finer prints (more Parts).
+- EditableMesh renderer: on low-memory devices Roblox may refuse more editable meshes. The affected
+  chunks are then drawn with Parts instead, and a warning is printed once.
 
 ## Development
 
 - `tools/test.sh` runs the offline test suite with the [`luau`](https://github.com/luau-lang/luau)
-  CLI: 128 checks across 6 suites.
+  CLI: 154 checks across 7 suites.
   - Unit tests for the geometry, heightfield and network codec.
   - End-to-end runs of the real client and server code against a small Roblox engine mock
-    (`tests/rbxmock.luau`). The mock's `EditableMesh` rejects invalid or mixed-up ids like the real
-    one.
+    (`tests/rbxmock.luau`), for both renderers. That includes a game where EditableMesh is blocked
+    (automatic switch to Parts) and checks that snow boxes never overlap. The mock's
+    `EditableMesh` rejects invalid or mixed-up ids like the real one.
 
   ```sh
   LUAU=/path/to/luau tools/test.sh

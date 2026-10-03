@@ -26,7 +26,9 @@ cp "$ROOT"/tests/*.luau "$WORK/"
 
 status=0
 for spec in "$WORK"/*.spec.luau; do
-	if ! out="$("$LUAU" "$spec" 2>&1)"; then
+	if ! out="$(timeout "${SPEC_TIMEOUT:-120}" "$LUAU" "$spec" 2>&1)"; then
+		out="$out
+$(basename "$spec"): FAILED (error or timeout)"
 		status=1
 	fi
 	echo "$out"

@@ -20,6 +20,7 @@ local Config = require(script.Parent.Config)
 local Shapes = require(script.Parent.Shapes)
 local SnowField = require(script.Parent.SnowField)
 local ChunkMesh = require(script.Parent.ChunkMesh)
+local ChunkParts = require(script.Parent.ChunkParts)
 local StampCodec = require(script.Parent.StampCodec)
 
 type Chunk = SnowField.Chunk
@@ -37,8 +38,25 @@ type PartInfo = {
 	collider: BasePart?,
 }
 
+-- what both renderers (ChunkParts and ChunkMesh) provide
+type Renderer = {
+	step: number,
+	gridVersion: number,
+	version: number,
+	usesFull: boolean,
+	destroy: (self: any) -> (),
+	applyDirty: (
+		self: any,
+		field: SnowField.SnowField,
+		chunk: Chunk,
+		dirty: { [number]: number }?,
+		all: boolean?,
+		tint: Color3
+	) -> (),
+}
+
 type RenderState = {
-	mesh: ChunkMesh.ChunkMesh?,
+	mesh: Renderer?,
 	wantStep: number,
 	wantFull: boolean,
 	priority: number,
@@ -94,7 +112,10 @@ local localPlayer = Players.LocalPlayer
 local field: SnowField.SnowField
 local snowFolder: Instance? = nil
 local renderFolder: Folder
-local style: ChunkMesh.Style
+local style: ChunkParts.Style
+-- "Parts" works everywhere; "EditableMesh" is smoother but needs the Mesh/Image APIs enabled
+local useParts = Config.Renderer ~= "EditableMesh"
+local warnedParts = false
 
 local parts: { [BasePart]: PartInfo } = {}
 local chunkParts: { [number]: { [BasePart]: boolean } } = {}
@@ -459,14 +480,21 @@ local function needsWork(chunk: Chunk, rs: RenderState): boolean
 	return false
 end
 
-local function stopAll(reason: string)
-	if stopped then
+-- EditableMesh is not available (e.g. a published game without "Enable Mesh / Image APIs"):
+-- switch every chunk over to the Parts renderer instead of giving up.
+local function switchToParts(reason: string)
+	if useParts then
 		return
 	end
-	stopped = true
-	warn("[DeformableSnow] stopped: " .. reason)
+	useParts = true
+	warn("[DeformableSnow] " .. reason .. " Switching to the Parts renderer (works everywhere).")
 	for _, chunk in field.chunks do
 		destroyRender(chunk)
+		local rs = chunk.render :: RenderState?
+		if rs then
+			rs.failedUntil = 0
+			rs.emptyVersion = -1
+		end
 	end
 end
 
@@ -506,7 +534,24 @@ local function doWork(chunk: Chunk, rs: RenderState)
 	end
 
 	rs.building = true
-	local mesh, reason = ChunkMesh.build(field, chunk, step, style, budget)
+	-- (no `:: any` directly on the calls: that would drop their second return value)
+	local mesh: Renderer?, reason: string?
+	if useParts then
+		local built, why = ChunkParts.build(field, chunk, step, style, budget)
+		mesh, reason = built :: any, why
+	else
+		local built, why = ChunkMesh.build(field, chunk, step, style, budget)
+		mesh, reason = built :: any, why
+		if reason == "budget" then
+			-- this device is out of EditableMesh memory: draw this chunk with Parts instead
+			local built2, why2 = ChunkParts.build(field, chunk, step, style, budget)
+			mesh, reason = built2 :: any, why2
+			if not warnedBudget then
+				warnedBudget = true
+				warn("[DeformableSnow] this device ran out of EditableMesh memory; some chunks use Parts instead.")
+			end
+		end
+	end
 	rs.building = false
 	if not alive(chunk) or stopped then
 		if mesh then
@@ -529,23 +574,18 @@ local function doWork(chunk: Chunk, rs: RenderState)
 		rs.emptyVersion = chunk.gridVersion
 		rs.emptyStep = step
 		destroyRender(chunk)
-	elseif reason == "budget" then
-		rs.failedUntil = now() + 5
-		if not warnedBudget then
-			warnedBudget = true
-			warn(
-				"[DeformableSnow] this device ran out of EditableMesh memory; far snow will be skipped. "
-					.. "Lower MaxRenderDistance / LodDistances or raise CellSize in Config."
-			)
-		end
+	elseif reason == "disabled" then
+		switchToParts(
+			"EditableMesh is not available here (published games need 'Enable Mesh / Image APIs', "
+				.. "which requires an ID-verified owner)."
+		)
 	elseif reason == "error" then
 		consecutiveErrors += 1
 		rs.failedUntil = now() + 2
 		if consecutiveErrors >= 3 then
-			stopAll(
-				"EditableMesh could not be created. For a published game, open the Creator Dashboard and "
-					.. "turn on 'Enable Mesh / Image APIs' for this experience (the owner must be 13+ and ID "
-					.. "verified). In Studio it works without that."
+			switchToParts(
+				"EditableMesh is not available here (published games need 'Enable Mesh / Image APIs', "
+					.. "which requires an ID-verified owner)."
 			)
 		end
 	end
@@ -568,9 +608,22 @@ local function workerLoop()
 				table.remove(workList, 1)
 			end
 			local target = picked :: Chunk
+			local rs = getState(target)
+			local before: { any } = { target.gridVersion, rs.mesh, target.full, target.stale, rs.emptyVersion, next(target.coarse) }
 			local ok, err = pcall(function()
-				doWork(target, getState(target))
+				doWork(target, rs)
 			end)
+			-- safety net: never spin on a chunk whose work did not change anything
+			local after: { any } = { target.gridVersion, rs.mesh, target.full, target.stale, rs.emptyVersion, next(target.coarse) }
+			local same = true
+			for k = 1, 6 do
+				if before[k] ~= after[k] then
+					same = false
+				end
+			end
+			if same and ok then
+				rs.failedUntil = now() + 1
+			end
 			if not ok then
 				warn("[DeformableSnow] loader error:", err)
 				getState(picked).failedUntil = now() + 3
@@ -621,6 +674,14 @@ local function plan()
 			step = 4
 		else
 			step = 8
+		end
+		if step > 0 and useParts and not rs.mesh and dist >= LOD2 and ChunkParts.liveCount > Config.MaxSnowParts then
+			-- too many snow Parts already: don't add far-away chunks
+			step = 0
+			if not warnedParts then
+				warnedParts = true
+				warn(`[DeformableSnow] over MaxSnowParts ({Config.MaxSnowParts}); far snow is not drawn. Raise CellSize or MaxSnowParts.`)
+			end
 		end
 		rs.wantStep = step
 		rs.wantFull = dist < DATA_DISTANCE or (t - chunk.lastNeeded) < 3
@@ -1157,7 +1218,14 @@ local function flushMeshes()
 			local rs = chunk.render :: RenderState?
 			local mesh = rs and rs.mesh
 			if mesh and mesh.usesFull then
-				mesh:applyDirty(field, chunk, dirty, false, tint)
+				local ok, err = pcall(mesh.applyDirty :: any, mesh, field, chunk, dirty, false, tint)
+				if not ok then
+					if useParts then
+						error(err, 0)
+					end
+					-- Roblox can revoke EditableMesh access mid-session
+					switchToParts("EditableMesh stopped working.")
+				end
 			end
 			for i, flag in dirty do
 				if flag == 1 then
@@ -1301,6 +1369,7 @@ function SnowClient.start()
 		material = Config.Material,
 		materialVariant = Config.MaterialVariant,
 		studsPerTile = math.max(0.5, Config.TextureStudsPerTile),
+		heightStep = math.max(0.005, Config.PartsHeightStep),
 		castShadow = Config.CastShadow,
 		parent = renderFolder,
 	}
@@ -1441,8 +1510,9 @@ function SnowClient.start()
 					nParts += 1
 				end
 				print(
-					`[DeformableSnow] parts={nParts} chunks={nChunks} simulated={nFull} meshes={nMesh} `
-						.. `regrowing={nActive} queue={#workList}`
+					`[DeformableSnow] snowParts={nParts} chunks={nChunks} simulated={nFull} drawn={nMesh} `
+						.. `regrowing={nActive} queue={#workList} renderer={if useParts then "Parts" else "EditableMesh"} `
+						.. `boxes={ChunkParts.liveCount}`
 				)
 			end
 		end

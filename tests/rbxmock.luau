@@ -801,6 +801,9 @@ end
 
 local AssetService = {}
 function AssetService:CreateEditableMesh()
+	if M.editableDisabled then
+		error("EditableMesh is not enabled for this experience")
+	end
 	if M.meshBudget and #M.meshes >= M.meshBudget then
 		return nil
 	end
@@ -909,8 +912,59 @@ function M.meshParts()
 	return out
 end
 
+-- all live snow boxes drawn by the Parts renderer
+function M.snowBoxes()
+	local out = {}
+	local render = Workspace:FindFirstChild("DeformableSnowRender")
+	if render then
+		for _, p in allDescendants(render, {}) do
+			if p.ClassName == "Part" and p.Name == "Snow" then
+				table.insert(out, p)
+			end
+		end
+	end
+	return out
+end
+
+-- top of the snow box covering (x, z), if any
+function M.boxTopY(x, z)
+	local best
+	for _, p in M.snowBoxes() do
+		local c, s = p.CFrame.Position, p.Size
+		if math.abs(x - c.X) <= s.X / 2 + 1e-9 and math.abs(z - c.Z) <= s.Z / 2 + 1e-9 then
+			local top = c.Y + s.Y / 2
+			if not best or top > best then
+				best = top
+			end
+		end
+	end
+	return best
+end
+
+-- number of pairs of snow boxes that overlap (they must tile without overlapping)
+function M.boxOverlaps()
+	local boxes = M.snowBoxes()
+	local n = 0
+	for a = 1, #boxes do
+		local ca, sa = boxes[a].CFrame.Position, boxes[a].Size
+		for b = a + 1, #boxes do
+			local cb, sb = boxes[b].CFrame.Position, boxes[b].Size
+			local ox = math.min(ca.X + sa.X / 2, cb.X + sb.X / 2) - math.max(ca.X - sa.X / 2, cb.X - sb.X / 2)
+			local oz = math.min(ca.Z + sa.Z / 2, cb.Z + sb.Z / 2) - math.max(ca.Z - sa.Z / 2, cb.Z - sb.Z / 2)
+			if ox > 1e-6 and oz > 1e-6 then
+				n += 1
+			end
+		end
+	end
+	return n
+end
+
 -- world-space vertex heights of all live chunk meshes near (x, z)
 function M.surfaceY(x, z)
+	local boxTop = M.boxTopY(x, z)
+	if boxTop then
+		return boxTop, 0
+	end
 	local best, bestD
 	for _, mp in allDescendants(Workspace, {}) do
 		if mp.ClassName == "MeshPart" and mp.MeshContent then

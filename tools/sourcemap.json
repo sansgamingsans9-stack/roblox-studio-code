@@ -5,6 +5,7 @@
    {"name":"Shapes","className":"ModuleScript","filePaths":["src/DeformableSnow/Shapes.luau"]},
    {"name":"SnowField","className":"ModuleScript","filePaths":["src/DeformableSnow/SnowField.luau"]},
    {"name":"StampCodec","className":"ModuleScript","filePaths":["src/DeformableSnow/StampCodec.luau"]},
+   {"name":"ChunkParts","className":"ModuleScript","filePaths":["src/DeformableSnow/ChunkParts.luau"]},
    {"name":"ChunkMesh","className":"ModuleScript","filePaths":["src/DeformableSnow/ChunkMesh.luau"]},
    {"name":"SnowClient","className":"ModuleScript","filePaths":["src/DeformableSnow/SnowClient.luau"]},
    {"name":"SnowServer","className":"ModuleScript","filePaths":["src/DeformableSnow/SnowServer.luau"]},

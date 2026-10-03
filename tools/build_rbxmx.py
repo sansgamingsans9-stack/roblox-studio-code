@@ -15,7 +15,7 @@ SRC = ROOT / "src" / "DeformableSnow"
 OUT = ROOT / "build" / "DeformableSnow.rbxmx"
 
 # modules first (in dependency order, purely cosmetic in the Explorer), then the two entry scripts
-ORDER = ["Config", "Shapes", "SnowField", "StampCodec", "ChunkMesh", "SnowClient", "SnowServer"]
+ORDER = ["Config", "Shapes", "SnowField", "StampCodec", "ChunkParts", "ChunkMesh", "SnowClient", "SnowServer"]
 RUN_CONTEXT = {"client": 2, "server": 1}  # Enum.RunContext values
 
 

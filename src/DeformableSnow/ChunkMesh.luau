@@ -31,6 +31,7 @@ export type Style = {
 	studsPerTile: number,
 	castShadow: boolean,
 	parent: Instance,
+	heightStep: number,
 }
 
 export type ChunkMesh = typeof(setmetatable(
@@ -163,8 +164,9 @@ end
 	Returns nil plus a reason when nothing could be built:
 	  "empty"  - no snow in this chunk
 	  "nodata" - the requested grid is not sampled
-	  "budget" - the device ran out of EditableMesh memory
-	  "error"  - the engine refused (e.g. Mesh/Image APIs disabled for this experience)
+	  "budget"   - the device ran out of EditableMesh memory
+	  "disabled" - EditableMesh is not allowed here (Mesh / Image APIs off for this experience)
+	  "error"    - building the mesh failed
 ]]
 function ChunkMesh.build(
 	field: SnowField.SnowField,
@@ -347,7 +349,9 @@ function ChunkMesh.build(
 	-- 6) upload
 	local okCreate, em = pcall(AssetService.CreateEditableMesh, AssetService)
 	if not okCreate then
-		return nil, "error"
+		-- e.g. "EditableMesh is not accessible. Go to the Security Tab ..." in published games
+		-- where the owner has not enabled the Mesh / Image APIs
+		return nil, "disabled"
 	end
 	if em == nil then
 		return nil, "budget"

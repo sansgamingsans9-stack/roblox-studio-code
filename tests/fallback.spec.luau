@@ -7,6 +7,8 @@ local Config = require("./mods/Config")
 
 R.disableBatch = true
 R.meshBudget = 3
+Config.Renderer = "EditableMesh"
+Config.CellSize = 0.5
 Config.SnowDepth = 1
 Config.ChunkCells = 16
 Config.LodDistances = { 16, 32, 64 }

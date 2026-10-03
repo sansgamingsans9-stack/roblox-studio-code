@@ -16,12 +16,23 @@ local Config = {
 	-- Folder in Workspace that holds the snow parts.
 	SnowFolderName = "SnowParts",
 
+	------------------------------------------------------------------ renderer
+	-- "Parts": the snow is drawn with ordinary Parts. Works in every game, no ID verification or
+	--          special setting needed. Prints have crisp, steep walls.
+	-- "EditableMesh": smooth mesh surface. Needs "Enable Mesh / Image APIs" in published games
+	--          (owner must be 13+ and ID verified). Falls back to "Parts" automatically when blocked.
+	Renderer = "Parts",
+	-- Parts renderer: snow heights are rounded to this step so flat areas merge into big boxes.
+	PartsHeightStep = 0.04,
+	-- Parts renderer: no new far-away chunks are drawn once this many snow Parts exist.
+	MaxSnowParts = 12000,
+
 	------------------------------------------------------------------ look
 	-- Studs of soft snow laid on top of each snow part. Characters standing on a collidable part
 	-- sink into this layer; on non-collidable parts they wade through to whatever is below.
 	SnowDepth = 1.0,
-	-- Grid spacing in studs. Smaller = sharper footprints but more memory/CPU. (0.25 .. 1)
-	CellSize = 0.5,
+	-- Grid spacing in studs. Smaller = sharper footprints but more memory/CPU. (0.2 .. 1)
+	CellSize = 0.25,
 	-- Snow thins out over this many studs at the edges of the snow area.
 	EdgeFalloff = 1.5,
 	-- Surfaces steeper than this (degrees) do not hold snow.

@@ -6,6 +6,8 @@ local StampCodec = require("./mods/StampCodec")
 local Config = require("./mods/Config")
 
 -- smaller world/settings so the test runs fast (must be set before SnowClient is required)
+Config.Renderer = "EditableMesh"
+Config.CellSize = 0.5
 Config.SnowDepth = 0.8
 Config.ChunkCells = 32
 Config.LodDistances = { 24, 48, 96 }
