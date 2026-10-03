@@ -34,7 +34,7 @@ local REST_EPS = 1e-3
 -- untouched tiles with at most this many flat snow levels (snow on parts at different heights) are
 -- drawn with boxes, the steps between levels become clean vertical edges, instead of a strip of
 -- triangles along every edge; more levels means a slope: triangles
-local MAX_LEVELS = 3
+local MAX_LEVELS = 4 -- (a tile where four parts of different heights meet)
 local LEVELS = 6 -- shades between fresh and fully packed snow
 local POOL_MAX = 6000
 local NO_KEY = math.huge
@@ -44,6 +44,7 @@ ChunkParts.__index = ChunkParts
 
 -- number of snow Parts currently in use by all chunks (the client uses it for its budget)
 ChunkParts.liveCount = 0
+ChunkParts.Q = Q
 
 export type Style = {
 	color: Color3,
@@ -99,6 +100,7 @@ export type ChunkParts = typeof(setmetatable(
 		solidCF: CFrame?,
 		tiles: { [number]: Tile },
 		sampleKey: { number },
+		sampleRest: { boolean }, -- per sample: untouched (cur == rest)? decides boxes vs triangles
 		partCount: number,
 		wedgeCount: number, -- of partCount, how many are triangle WedgeParts
 		ox: number,
@@ -137,6 +139,10 @@ local function takeBox(style: Style): Part
 	ChunkParts.liveCount += 1
 	local pooled = table.remove(boxPool)
 	if pooled then
+		-- the quality level may have turned shadows on/off since it was pooled
+		if pooled.CastShadow ~= style.castShadow then
+			pooled.CastShadow = style.castShadow
+		end
 		return pooled
 	end
 	local p = Instance.new("Part")
@@ -148,6 +154,9 @@ local function takeWedge(style: Style): WedgePart
 	ChunkParts.liveCount += 1
 	local pooled = table.remove(wedgePool)
 	if pooled then
+		if pooled.CastShadow ~= style.castShadow then
+			pooled.CastShadow = style.castShadow
+		end
 		return pooled
 	end
 	local p = Instance.new("WedgePart")
@@ -199,16 +208,6 @@ function ChunkParts.prewarm(style: Style, boxes: number, wedges: number, budget:
 		if made % 25 == 0 then
 			budget()
 		end
-	end
-end
-
--- Turns snow shadows on/off for the pooled Parts (live chunks use ChunkParts.setShadows).
-function ChunkParts.setPoolShadows(on: boolean)
-	for _, p in boxPool do
-		p.CastShadow = on
-	end
-	for _, p in wedgePool do
-		p.CastShadow = on
 	end
 end
 
@@ -410,7 +409,8 @@ local function triLevel(ia: number, ib: number, ic: number): number
 end
 
 -- Two WedgeParts that together draw triangle (a, b, c), their top faces exactly on the triangle.
-local function wedgeFrames(a: Vector3, b: Vector3, c: Vector3): (Vector3?, CFrame?, Vector3?, CFrame?)
+local function wedgeFrames(a: Vector3, b: Vector3, c: Vector3, thick: number?): (Vector3?, CFrame?, Vector3?, CFrame?)
+	local t = thick or THICK
 	local ab, ac, bc = b - a, c - a, c - b
 	local abd, acd, bcd = ab:Dot(ab), ac:Dot(ac), bc:Dot(bc)
 	-- make bc the longest edge; a is then the corner opposite to it
@@ -429,10 +429,10 @@ local function wedgeFrames(a: Vector3, b: Vector3, c: Vector3): (Vector3?, CFram
 	local back = bc.Unit
 	local height = math.abs(ab:Dot(up))
 	-- the wedges' thickness goes below the surface
-	local down = (if right.Y >= 0 then right else -right) * (-THICK * 0.5)
-	return Vector3.new(THICK, height, math.abs(ab:Dot(back))),
+	local down = (if right.Y >= 0 then right else -right) * (-t * 0.5)
+	return Vector3.new(t, height, math.abs(ab:Dot(back))),
 		CFrame.fromMatrix((a + b) * 0.5 + down, right, up, back),
-		Vector3.new(THICK, height, math.abs(ac:Dot(back))),
+		Vector3.new(t, height, math.abs(ac:Dot(back))),
 		CFrame.fromMatrix((a + c) * 0.5 + down, -right, up, -back)
 end
 ChunkParts.wedgeFrames = wedgeFrames
@@ -478,7 +478,7 @@ local function gather(self: ChunkParts, src: Source, ti: number, tj: number): (n
 	local i0, j0 = ti * self.tileCells, tj * self.tileCells
 	local stride, n = src.stride, src.n
 	local nS = self.nSide + 1
-	local keyCache = self.sampleKey
+	local keyCache, restCache = self.sampleKey, self.sampleRest
 	local any, deformed = false, false
 	-- the distinct snow levels of the tile (rounded like drawn heights), up to MAX_LEVELS
 	local nLevels = 0
@@ -500,7 +500,9 @@ local function gather(self: ChunkParts, src: Source, ti: number, tj: number): (n
 				sH[idx] = key * Q
 				keyCache[cj * nS + ci + 1] = key
 				any = true
-				if math.abs(cur - rest) > REST_EPS then
+				local atRest = math.abs(cur - rest) <= REST_EPS
+				restCache[cj * nS + ci + 1] = atRest
+				if not atRest then
 					deformed = true
 				end
 				if nLevels <= MAX_LEVELS then
@@ -521,6 +523,7 @@ local function gather(self: ChunkParts, src: Source, ti: number, tj: number): (n
 				sSnow[idx] = false
 				sH[idx] = 0
 				keyCache[cj * nS + ci + 1] = NO_KEY
+				restCache[cj * nS + ci + 1] = true
 			end
 		end
 	end
@@ -534,6 +537,14 @@ local visited: { boolean } = table.create(TILE * TILE, false)
 local rects: { number } = {}
 
 -- Level, untouched snow: merge the snow cells (all four corners have snow) into boxes.
+local sBySig: { [number]: number } = {}
+local sClaimed: { [number]: boolean } = {}
+local sAssign: { number } = {}
+local sFree: { number } = {}
+local sPendingSig: { number } = {}
+local sPendingIdx: { number } = {}
+local sSpare: { TriRec } = {}
+
 local function buildBoxes(self: ChunkParts, tile: Tile, g: number, ti: number, tj: number)
 	local w = g - 1
 	for y = 0, w - 1 do
@@ -604,12 +615,16 @@ local function buildBoxes(self: ChunkParts, tile: Tile, g: number, ti: number, t
 	end
 
 	-- keep boxes whose rectangle did not move, reuse the others
-	local bySig: { [number]: number } = {}
+	-- (module-level scratch tables: a rebuild never yields, so they can be reused)
+	local bySig = sBySig
+	table.clear(bySig)
 	for k, s in tile.boxSig do
 		bySig[s] = k
 	end
-	local claimed: { [number]: boolean } = {}
-	local assign: { number } = table.create(count, 0)
+	local claimed = sClaimed
+	table.clear(claimed)
+	local assign = sAssign
+	table.clear(assign)
 	for r = 0, count - 1 do
 		local o = r * 6
 		local sig = rects[o + 1] + rects[o + 2] * 32 + rects[o + 3] * 1024 + rects[o + 4] * 32768
@@ -619,7 +634,8 @@ local function buildBoxes(self: ChunkParts, tile: Tile, g: number, ti: number, t
 			assign[r + 1] = k
 		end
 	end
-	local free: { number } = {}
+	local free = sFree
+	table.clear(free)
 	for k = 1, #tile.boxes do
 		if not claimed[k] then
 			table.insert(free, k)
@@ -643,7 +659,7 @@ local function buildBoxes(self: ChunkParts, tile: Tile, g: number, ti: number, t
 		local sx, sz = rw * cw, rh * cw
 		local size = Vector3.new(sx, top - bottom, sz)
 		local cf = CFrame.new(x0w + rx * cw + sx * 0.5, (top + bottom) * 0.5, z0w + ry * cw + sz * 0.5)
-		local k = assign[r + 1]
+		local k = assign[r + 1] or 0
 		if k == 0 then
 			k = table.remove(free) or 0
 		end
@@ -690,12 +706,30 @@ local function buildTriangles(self: ChunkParts, tile: Tile, g: number, ti: numbe
 	local old = tile.tris
 	local new: { [number]: TriRec } = {}
 	local newCount = 0
-	local pendingSig: { number } = {}
-	local pendingIdx: { number } = {}
+	local pendingSig = sPendingSig
+	table.clear(pendingSig)
+	local pendingIdx = sPendingIdx
+	table.clear(pendingIdx)
 	local style, folder, colors = self.style, self.folder, self.colors
 
 	local function vertex(x: number, y: number): Vector3
 		return Vector3.new(x0w + x * cw, sH[y * g + x + 1], z0w + y * cw)
+	end
+
+	-- Near-flat triangles hang a slab down to the ground, so the snow has solid sides at its edges
+	-- and at chunk borders, like the boxes. Steep ones (the walls of prints) stay thin.
+	local function slab(ia: number, ib: number, ic: number, a: Vector3, b: Vector3, c: Vector3): number
+		local n = (b - a):Cross(c - a)
+		local len = n.Magnitude
+		if len < 1e-9 then
+			return THICK
+		end
+		local nY = math.abs(n.Y) / len
+		if nY < 0.8 then
+			return THICK
+		end
+		local depth = math.min(a.Y, b.Y, c.Y) - math.min(sBase[ia], sBase[ib], sBase[ic]) + SINK
+		return math.max(THICK, depth * nY)
 	end
 
 	-- 1) keep triangles that still exist (only touched if a corner moved)
@@ -717,7 +751,8 @@ local function buildTriangles(self: ChunkParts, tile: Tile, g: number, ti: numbe
 					old[sig] = nil
 					local ka, kb, kc = sKey[ia], sKey[ib], sKey[ic]
 					if rec.ka ~= ka or rec.kb ~= kb or rec.kc ~= kc then
-						local s1, c1, s2, c2 = wedgeFrames(vertex(ax, ay), vertex(bx, by), vertex(cx, cy))
+						local va, vb, vc = vertex(ax, ay), vertex(bx, by), vertex(cx, cy)
+						local s1, c1, s2, c2 = wedgeFrames(va, vb, vc, slab(ia, ib, ic, va, vb, vc))
 						if s1 and c1 and s2 and c2 then
 							rec.w1.Size, rec.w2.Size = s1, s2
 							place(rec.w1, c1, true)
@@ -741,7 +776,8 @@ local function buildTriangles(self: ChunkParts, tile: Tile, g: number, ti: numbe
 	end
 
 	-- 2) wedges of triangles that disappeared are reused for the new ones
-	local spare: { TriRec } = {}
+	local spare = sSpare
+	table.clear(spare)
 	for _, rec in old do
 		table.insert(spare, rec)
 	end
@@ -750,7 +786,8 @@ local function buildTriangles(self: ChunkParts, tile: Tile, g: number, ti: numbe
 		local ax, ay, bx, by, cx, cy =
 			triOut[o + 1], triOut[o + 2], triOut[o + 3], triOut[o + 4], triOut[o + 5], triOut[o + 6]
 		local ia, ib, ic = ay * g + ax + 1, by * g + bx + 1, cy * g + cx + 1
-		local s1, c1, s2, c2 = wedgeFrames(vertex(ax, ay), vertex(bx, by), vertex(cx, cy))
+		local va, vb, vc = vertex(ax, ay), vertex(bx, by), vertex(cx, cy)
+		local s1, c1, s2, c2 = wedgeFrames(va, vb, vc, slab(ia, ib, ic, va, vb, vc))
 		if s1 and c1 and s2 and c2 then
 			local level = triLevel(ia, ib, ic)
 			local rec = table.remove(spare)
@@ -837,6 +874,7 @@ local function uniformChunk(self: ChunkParts, src: Source): (number?, number)
 			end
 			local k = math.floor(cur / Q + 0.5)
 			keyCache[j * nS + i + 1] = k
+			self.sampleRest[j * nS + i + 1] = true
 			if key == nil then
 				key, restRef = k, rest
 			elseif math.abs(rest - restRef) > REST_EPS then
@@ -907,6 +945,9 @@ local function rebuildAll(self: ChunkParts, src: Source, budget: (() -> ())?)
 			rebuildTile(self, src, ti, tj)
 			if budget then
 				budget()
+				if self.destroyed then
+					return -- (destroyed while waiting for the next frame)
+				end
 			end
 		end
 	end
@@ -969,6 +1010,7 @@ function ChunkParts.build(
 		solidCF = nil,
 		tiles = {},
 		sampleKey = table.create((nSide + 1) * (nSide + 1), NO_KEY),
+		sampleRest = table.create((nSide + 1) * (nSide + 1), true),
 		partCount = 0,
 		wedgeCount = 0,
 		ox = chunk.cx * C * S + NUDGE,
@@ -976,7 +1018,12 @@ function ChunkParts.build(
 		cellW = step * S,
 		-- lower detail levels tolerate a little more error
 		maxError = math.max(0.005, style.smoothness) * math.sqrt(step),
-		cliff = p.cliffHeight,
+		-- a jump between neighbouring samples is a cliff when it is taller than CliffHeight and
+		-- steeper than snow can lie (coarse samples are far apart: a slope there is not a cliff)
+		cliff = math.max(
+			p.cliffHeight,
+			step * S * math.sqrt(math.max(0, 1 - p.maxSlopeCos * p.maxSlopeCos)) / math.max(p.maxSlopeCos, 1e-3)
+		),
 		colors = makeColors(style),
 		style = style,
 	}, ChunkParts)
@@ -984,6 +1031,42 @@ function ChunkParts.build(
 	rebuildAll(self, src, budget)
 	folder.Parent = style.parent
 	return self, nil
+end
+
+--[[
+	New smoothness (the quality level changed): re-triangulates the triangle tiles in place.
+	Boxes, and triangles that come out the same, are not touched; a chunk without triangles costs
+	nothing. `budget` may yield between tiles.
+]]
+function ChunkParts.restyle(self: ChunkParts, chunk: SnowField.Chunk, smoothness: number, budget: (() -> ())?)
+	local maxError = math.max(0.005, smoothness) * math.sqrt(self.step)
+	if self.destroyed or maxError == self.maxError then
+		return
+	end
+	self.maxError = maxError
+	if self.wedgeCount == 0 then
+		return
+	end
+	local src = sourceFor(chunk, self.step)
+	if not src then
+		return
+	end
+	local tps = self.tilesPerSide
+	local list = {}
+	for index, tile in self.tiles do
+		if tile.kind == 2 then
+			table.insert(list, index)
+		end
+	end
+	for _, index in list do
+		if self.destroyed then
+			return
+		end
+		rebuildTile(self, src, index % tps, index // tps)
+		if budget then
+			budget()
+		end
+	end
 end
 
 -- Turns shadows on/off for every Part of this chunk.
@@ -1027,7 +1110,8 @@ function ChunkParts.applyDirty(
 	chunk: SnowField.Chunk,
 	dirty: { [number]: number }?,
 	all: boolean?,
-	_tint: Color3
+	_tint: Color3,
+	budget: (() -> ())?
 )
 	if self.destroyed then
 		return
@@ -1039,7 +1123,7 @@ function ChunkParts.applyDirty(
 	local src: Source = { base = full.base, rest = full.rest, cur = full.cur, n = full.n, stride = self.step }
 
 	if all then
-		rebuildAll(self, src, nil)
+		rebuildAll(self, src, budget)
 		return
 	end
 
@@ -1049,7 +1133,7 @@ function ChunkParts.applyDirty(
 		local step = self.step
 		local tc, tps, nSide = self.tileCells, self.tilesPerSide, self.nSide
 		local nS = nSide + 1
-		local keyCache = self.sampleKey
+		local keyCache, restCache = self.sampleKey, self.sampleRest
 		local marked: { [number]: boolean } = {}
 		local any = false
 		for i, flag in dirty do
@@ -1059,13 +1143,19 @@ function ChunkParts.applyDirty(
 				if lx % step == 0 and lz % step == 0 then
 					local ci, cj = lx // step, lz // step
 					local o = i * 4
-					local key = if readf32(full.base, o) > NO_SNOW_LIMIT
-						then math.floor(readf32(full.cur, o) / Q + 0.5)
-						else NO_KEY
+					local key, atRest = NO_KEY, true
+					if readf32(full.base, o) > NO_SNOW_LIMIT then
+						local cur = readf32(full.cur, o)
+						key = math.floor(cur / Q + 0.5)
+						atRest = math.abs(cur - readf32(full.rest, o)) <= REST_EPS
+					end
 					local c = cj * nS + ci + 1
-					-- only samples whose drawn height changed need their tiles rebuilt
-					if keyCache[c] ~= key then
+					-- only samples whose drawn height changed need their tiles rebuilt, or that
+					-- became untouched again (the tile may turn back into boxes: the last bit of
+					-- regrowing is too small to change the drawn height)
+					if keyCache[c] ~= key or restCache[c] ~= atRest then
 						keyCache[c] = key
+						restCache[c] = atRest
 						any = true
 						-- a sample on a tile border belongs to up to four tiles
 						local tiA, tjA = math.min(ci // tc, tps - 1), math.min(cj // tc, tps - 1)

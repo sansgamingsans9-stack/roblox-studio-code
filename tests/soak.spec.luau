@@ -218,9 +218,16 @@ for _ = 1, 10 do
 end
 run(2)
 
--- a slow stretch (the quality tier steps down), then smooth again (it climbs back)
-run(20, 1 / 15)
+-- a slow stretch where the snow is what costs time (the quality tier steps down until the frame
+-- rate is fine), then smooth again (it climbs back)
 local render = R.Workspace:FindFirstChild("DeformableSnowRender")
+local slowFps = { High = 15, Medium = 20, Low = 45, Potato = 50 }
+local slowFor = 0
+while slowFor < 25 do
+	local dt = 1 / slowFps[render:GetAttribute("SnowQuality")]
+	run(dt, dt)
+	slowFor += dt
+end
 local lowered = render:GetAttribute("SnowQuality")
 run(100, 1 / 60)
 

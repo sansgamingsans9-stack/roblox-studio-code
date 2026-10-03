@@ -49,13 +49,16 @@ type Renderer = {
 	wedgeCount: number?, -- Parts renderer only
 	solid: any?, -- Parts renderer only: the chunk is one single box
 	destroy: (self: any) -> (),
+	restyle: ((self: any, chunk: Chunk, smoothness: number, budget: (() -> ())?) -> ())?, -- Parts only
+	setShadows: (self: any, on: boolean) -> (),
 	applyDirty: (
 		self: any,
 		field: SnowField.SnowField,
 		chunk: Chunk,
 		dirty: { [number]: number }?,
 		all: boolean?,
-		tint: Color3
+		tint: Color3,
+		budget: (() -> ())?
 	) -> (),
 }
 
@@ -66,6 +69,13 @@ type RenderState = {
 	priority: number,
 	dist: number,
 	styleVersion: number,
+	lastFlush: number, -- when its Parts were last updated with the snow's changes
+	-- Parts renderer: real Part counts of the builds at each detail level (step -> count, time)
+	partsAt: { [number]: number },
+	partsAtTime: { [number]: number },
+	-- the Parts budget lowered this chunk to `reducedTo` until `reducedUntil` (no popping)
+	reducedTo: number,
+	reducedUntil: number,
 	building: boolean,
 	failedUntil: number,
 	emptyVersion: number,
@@ -82,10 +92,12 @@ type CharInfo = {
 	conns: { RBXScriptConnection },
 	fxCooldown: { [BasePart]: number },
 	lastSent: { [BasePart]: { t: number, pos: Vector3 } },
+	lastPress: { [BasePart]: { number } },
 }
 
 type DynInfo = {
 	kind: number,
+	last: { number }, -- x, y, z, time of the previous press
 	lastCF: CFrame?,
 	lastSize: Vector3?,
 	lastStamp: number,
@@ -133,14 +145,19 @@ local CHUNK_SPAN = CELL * CHUNK_CELLS
 local NEAR_KEEP = 16 -- the Parts budget never lowers the detail of snow this close to the camera
 local FX_DIST2 = 120 * 120
 local SOUND_DIST2 = 60 * 60
-local PRELOAD_BUDGET = 0.012 -- seconds per frame the loader may use while preloading
+
+-- "Parts" works everywhere; "EditableMesh" is smoother but needs the Mesh/Image APIs enabled
+local useParts = Config.Renderer ~= "EditableMesh"
 
 -- these follow the quality tier (see applyTier)
 local LOD1, LOD2, LOD3 = 64, 128, 256
+local RENDER_DIST = 512
 local DATA_DISTANCE = LOD1 -- chunks closer than this are always simulated (others only where needed)
 local SIM_DIST2 = 0
+local CHAR_SIM_DIST2 = 0 -- other players' feet are simulated within this (squared) distance
 local BUDGET = 0.003
 local MAX_PARTS = 12000
+local REGROW_INTERVAL = 0.25
 local styleVersion = 0
 
 local function tierSettings()
@@ -149,11 +166,21 @@ local function tierSettings()
 	LOD1 = math.max((lod[1] or 32) * tier.lodScale, math.min(lod[1] or 32, 20))
 	LOD2 = math.max((lod[2] or 64) * tier.lodScale, LOD1)
 	LOD3 = math.max((lod[3] or 128) * tier.lodScale, LOD2)
+	RENDER_DIST = math.max(Config.MaxRenderDistance * tier.lodScale, math.min(Config.MaxRenderDistance, LOD3))
 	DATA_DISTANCE = LOD1
 	local sim = Config.SimulationDistance * tier.simDistance
 	SIM_DIST2 = sim * sim
+	-- weak devices: other players farther than the last detail ring only show up through the
+	-- server (simulating them would load full-detail snow where it is drawn coarsely anyway)
+	local charSim = if tierIndex <= 2 then math.min(sim, LOD3) else sim
+	CHAR_SIM_DIST2 = charSim * charSim
 	BUDGET = math.max(0.5, math.min(Config.FrameBudgetMs, tier.budgetMs)) / 1000
 	MAX_PARTS = math.max(1, math.floor(Config.MaxSnowParts * tier.maxParts / 12000))
+	-- the Parts renderer draws heights in steps of ChunkParts.Q: regrowing in smaller steps than
+	-- that rewrites the same Parts over and over for nothing
+	REGROW_INTERVAL = if useParts and Config.RegrowSpeed > 0
+		then math.max(0.25, tier.regrowSteps * ChunkParts.Q / Config.RegrowSpeed)
+		else 0.25
 end
 tierSettings()
 
@@ -168,12 +195,23 @@ local field: SnowField.SnowField
 local snowFolder: Instance? = nil
 local renderFolder: Folder
 local style: ChunkParts.Style
--- "Parts" works everywhere; "EditableMesh" is smoother but needs the Mesh/Image APIs enabled
-local useParts = Config.Renderer ~= "EditableMesh"
 local warnedParts = false
 -- chunks that are simulated (have full data): the only ones that can change every frame
 local simChunks: { [Chunk]: boolean } = {}
 local preloadUntil = 0
+local lastTracked = 0 -- when a snow part was last added (they may still be streaming in)
+local simEpoch = 0 -- bumped whenever a chunk starts being simulated (resting parts must press it)
+local deepestSnow = Config.SnowDepth -- deepest snow on any part so far (how long prints last)
+-- prints of chunks whose snow parts streamed out, restored when they stream back in
+local detached: { [number]: { full: any, pending: any, time: number } } = {}
+
+-- How long a print takes to fill back in completely (nil: prints are permanent).
+local function maxPrintAge(): number?
+	if Config.RegrowSpeed <= 0 then
+		return nil
+	end
+	return Config.RegrowDelay + deepestSnow * (1 + Config.RimRatio) / Config.RegrowSpeed + 1
+end
 
 local parts: { [BasePart]: PartInfo } = {}
 local chunkParts: { [number]: { [BasePart]: boolean } } = {}
@@ -194,9 +232,21 @@ local camPos = Vector3.zero
 local stopped = false
 local consecutiveErrors = 0
 
+local useFolder: (sf: Instance) -> ()
 local remote: RemoteEvent? = nil
 local partsReady = false
 local outbox: { StampCodec.Stamp } = {}
+
+-- chunks that hold something (a mesh, low-detail data, a simulation) or that someone needs:
+-- planned even when out of range, so they get loaded or released. Chunks far away with nothing
+-- loaded cost nothing per plan.
+local loaded: { [Chunk]: boolean } = {}
+
+-- Someone is (about to be) pressing this chunk: load its simulation.
+local function need(chunk: Chunk, t: number)
+	chunk.lastNeeded = t
+	loaded[chunk] = true
+end
 
 -- scratch objects reused every frame
 local shape = Shapes.new()
@@ -254,6 +304,11 @@ local function getState(chunk: Chunk): RenderState
 			priority = math.huge,
 			dist = math.huge,
 			styleVersion = 0,
+			lastFlush = 0,
+			partsAt = {},
+			partsAtTime = {},
+			reducedTo = 0,
+			reducedUntil = 0,
 			building = false,
 			failedUntil = 0,
 			emptyVersion = -1,
@@ -369,6 +424,36 @@ local function trackPart(part: BasePart)
 		info.collider = makeCollider(part)
 	end
 	parts[part] = info
+	lastTracked = now()
+	if info.depth > deepestSnow then
+		deepestSnow = info.depth
+		field.params.maxPendingAge = maxPrintAge()
+	end
+	-- a snow part streaming back in (StreamingEnabled): the prints on it come back
+	for _, key in info.keys do
+		local d = detached[key]
+		if d then
+			detached[key] = nil
+			local chunk = field.chunks[key]
+			local age = maxPrintAge()
+			if chunk and not chunk.full and (age == nil or now() - d.time < age) then
+				if d.full then
+					-- re-read below (markStale) with the new parts, the prints are carried over
+					chunk.full = d.full
+					simEpoch += 1
+					simChunks[chunk] = true
+					loaded[chunk] = true
+				end
+				if d.pending then
+					local list = chunk.pending or {}
+					for _, item in d.pending do
+						table.insert(list, item)
+					end
+					chunk.pending = list
+				end
+			end
+		end
+	end
 	for _, key in info.keys do
 		local set = chunkParts[key]
 		if not set then
@@ -411,6 +496,12 @@ local function releaseInfo(part: BasePart, info: PartInfo, keep: { [number]: boo
 	end
 	field:markStale(info.minX, info.maxX, info.minZ, info.maxZ)
 	for _, chunk in field:removeRegion(info.keys) do
+		-- (keep its prints for a while: the part may only have streamed out)
+		local full = chunk.full
+		local active = full and full.activeCount > 0
+		if active or chunk.pending then
+			detached[chunk.key] = { full = if active then full else nil, pending = chunk.pending, time = now() }
+		end
 		destroyRender(chunk)
 		simChunks[chunk] = nil
 	end
@@ -507,7 +598,8 @@ end
 local workStart = os.clock()
 local function budget()
 	-- while preloading, background work may use more of each frame so the snow is ready fast
-	local limit = if now() < preloadUntil then math.max(BUDGET, PRELOAD_BUDGET) else BUDGET
+	-- (4x the normal budget: 12 ms on High, 6 ms on Potato)
+	local limit = if now() < preloadUntil then BUDGET * 4 else BUDGET
 	if os.clock() - workStart > limit then
 		RunService.Heartbeat:Wait()
 		workStart = os.clock()
@@ -552,6 +644,7 @@ local function switchToParts(reason: string)
 		return
 	end
 	useParts = true
+	tierSettings()
 	warn("[DeformableSnow] " .. reason .. " Switching to the Parts renderer (works everywhere).")
 	for _, chunk in field.chunks do
 		destroyRender(chunk)
@@ -570,7 +663,8 @@ local function doWork(chunk: Chunk, rs: RenderState)
 		if chunk.full or rs.wantFull then
 			local grid = field:sampleGrid(chunk, 1, samplerFor(chunk), budget)
 			if alive(chunk) then
-				field:attachFull(chunk, grid, now())
+				field:attachFull(chunk, grid, now(), budget)
+				simEpoch += 1
 				simChunks[chunk] = true
 			end
 		end
@@ -583,7 +677,8 @@ local function doWork(chunk: Chunk, rs: RenderState)
 	if rs.wantFull and not chunk.full and not (quick and rs.emptyVersion ~= chunk.gridVersion) then
 		local grid = field:sampleGrid(chunk, 1, samplerFor(chunk), budget)
 		if alive(chunk) and not chunk.full then
-			field:attachFull(chunk, grid, now())
+			field:attachFull(chunk, grid, now(), budget)
+			simEpoch += 1
 			simChunks[chunk] = true
 		end
 		return
@@ -600,11 +695,31 @@ local function doWork(chunk: Chunk, rs: RenderState)
 		return
 	end
 
+	-- only the quality level changed: re-triangulate in place (unchanged Parts stay untouched)
+	local current = rs.mesh
+	local restyle = current and current.restyle
+	if
+		useParts
+		and current
+		and restyle
+		and current.step == step
+		and current.gridVersion == chunk.gridVersion
+		and rs.styleVersion ~= styleVersion
+	then
+		local version = styleVersion
+		rs.building = true
+		restyle(current, chunk, style.smoothness, budget)
+		rs.building = false
+		rs.styleVersion = version
+		return
+	end
+
 	rs.building = true
 	-- (no `:: any` directly on the calls: that would drop their second return value)
 	local mesh: Renderer?, reason: string?
 	local builtWithParts = useParts
 	local buildStyle = styleVersion
+	local buildShadows = style.castShadow
 	if useParts then
 		local built, why = ChunkParts.build(field, chunk, step, style, budget)
 		mesh, reason = built :: any, why
@@ -636,9 +751,13 @@ local function doWork(chunk: Chunk, rs: RenderState)
 		if old then
 			old:destroy()
 		end
+		if style.castShadow ~= buildShadows then
+			-- the quality level turned shadows on/off while this chunk was being built
+			mesh:setShadows(style.castShadow)
+		end
 		if mesh.usesFull and chunk.version ~= mesh.version then
-			-- the snow changed while the mesh was being built
-			mesh:applyDirty(field, chunk, nil, true, Config.PackedSnowTint)
+			-- the snow changed while the mesh was being built (catch up, a tile per budget slice)
+			mesh:applyDirty(field, chunk, nil, true, Config.PackedSnowTint, budget)
 		end
 	elseif reason == "empty" then
 		rs.emptyVersion = chunk.gridVersion
@@ -699,7 +818,8 @@ local function workerLoop()
 			end
 			if not ok then
 				warn("[DeformableSnow] loader error:", err)
-				getState(picked).failedUntil = now() + 3
+				rs.building = false -- or the chunk would never be worked on again
+				rs.failedUntil = now() + 3
 				table.remove(workList, 1)
 			end
 			budget()
@@ -718,45 +838,68 @@ local cappedFor = 0 -- seconds the budget has been reducing detail in a row
 -- Parts renderer budget: nearest chunks first; once the estimated number of snow Parts passes
 -- MaxSnowParts, farther chunks get coarser detail, and beyond the last detail ring none. Snow
 -- closer than NEAR_KEEP studs is never reduced. Hysteresis keeps it from flapping.
-local function applyPartBudget(all: { Chunk })
-	table.sort(all, function(a: Chunk, b: Chunk)
-		return (a.render :: RenderState).dist < (b.render :: RenderState).dist
-	end)
+local function byDist(a: Chunk, b: Chunk): boolean
+	return (a.render :: RenderState).dist < (b.render :: RenderState).dist
+end
+
+-- Estimated number of snow Parts for a chunk drawn at `want`.
+local function estimateParts(rs: RenderState, want: number, t: number): number
+	-- what a build at this detail really cost (a while ago at most: prints come and go)
+	local known = rs.partsAt[want]
+	if known and t - rs.partsAtTime[want] < 10 then
+		return math.max(1, known)
+	end
+	local mesh = rs.mesh
+	if not mesh or not mesh.partCount then
+		return 1
+	end
+	if mesh.solid then
+		return 1 -- a single-box chunk stays one box at any detail
+	end
+	-- otherwise ~4x per detail level (on the safe side: guessing low makes chunks pop back and forth)
+	local ratio = mesh.step / want
+	return math.max(1, mesh.partCount * ratio * ratio)
+end
+
+local function applyPartBudget(drawn: { Chunk }, t: number)
+	table.sort(drawn, byDist)
 	local cap = MAX_PARTS * (if overBudget then 0.9 else 1)
 	local used = 0
 	local capped = false
-	for _, chunk in all do
+	for _, chunk in drawn do
 		local rs = chunk.render :: RenderState
+		local mesh = rs.mesh
+		if mesh and mesh.partCount and mesh.gridVersion == chunk.gridVersion then
+			rs.partsAt[mesh.step] = mesh.partCount
+			rs.partsAtTime[mesh.step] = t
+		end
 		local want = rs.wantStep
-		if want > 0 then
-			local mesh = rs.mesh
-			local est = 1
-			if mesh and mesh.partCount then
-				-- a single-box chunk stays one box at any detail. Boxes scale with the number of
-				-- tiles (~4x per detail level); triangles mostly trace print outlines (~2x per level).
-				local ratio = mesh.step / want
-				local wedges = mesh.wedgeCount or 0
-				est = if mesh.solid
-					then 1
-					else math.max(1, (mesh.partCount - wedges) * ratio * ratio + wedges * ratio)
+		if rs.dist >= NEAR_KEEP then
+			-- recently lowered by the budget: stay there for a moment
+			if t < rs.reducedUntil and want < rs.reducedTo then
+				want = rs.reducedTo
 			end
-			if rs.dist >= NEAR_KEEP then
-				while used + est > cap and want < 8 do
-					want *= 2
-					est = math.max(1, est / 4)
-				end
-				-- only far snow may be left out entirely: a missing chunk nearby looks like a hole
-				if used + est > cap and rs.dist >= LOD3 and not (rs.emptyVersion == chunk.gridVersion) then
-					want = 0
-				end
+			local est = estimateParts(rs, want, t)
+			while used + est > cap and want < 8 do
+				want *= 2
+				est = estimateParts(rs, want, t)
+			end
+			-- only far snow may be left out entirely: a missing chunk nearby looks like a hole
+			if used + est > cap and rs.dist >= LOD3 and not (rs.emptyVersion == chunk.gridVersion) then
+				want = 0
 			end
 			if want ~= rs.wantStep then
 				capped = true
+				if want > rs.wantStep and want ~= rs.reducedTo then
+					rs.reducedTo, rs.reducedUntil = want, t + 4
+				end
 				rs.wantStep = want
 			end
 			if want > 0 then
 				used += est
 			end
+		else
+			used += estimateParts(rs, want, t)
 		end
 	end
 	overBudget = capped
@@ -771,54 +914,105 @@ local function applyPartBudget(all: { Chunk })
 	end
 end
 
+-- drawn but not simulated chunks within LOD2: also searched for loose parts, a few per scan
+local scanFar: { Chunk } = {}
+local scanFarIndex = 0
+-- the chunks of the last plan (fresh distances)
+local planned: { Chunk } = {}
+local plannedSet: { [Chunk]: boolean } = {}
+
+local function byPriority(a: Chunk, b: Chunk): boolean
+	return (a.render :: RenderState).priority < (b.render :: RenderState).priority
+end
+
+local function planChunk(chunk: Chunk, t: number)
+	local rs = getState(chunk)
+	local halfSpan = CHUNK_SPAN * 0.5
+	local cxw, czw = field:chunkCenter(chunk)
+	local dx = math.max(math.abs(camPos.X - cxw) - halfSpan, 0)
+	local dz = math.max(math.abs(camPos.Z - czw) - halfSpan, 0)
+	local lo, hi = camPos.Y, camPos.Y
+	local full = chunk.full
+	if full then
+		lo, hi = full.minY, full.maxY
+	else
+		for _, g in chunk.coarse do
+			lo, hi = g.minY, g.maxY
+			break
+		end
+	end
+	local dy = if camPos.Y < lo then lo - camPos.Y elseif camPos.Y > hi then camPos.Y - hi else 0
+	local dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+	rs.dist = dist
+	-- chunks someone nearby is about to step into jump the queue
+	rs.priority = if not full and (t - chunk.lastNeeded) < 3 and dist < LOD2 then dist - 100000 else dist
+
+	local step
+	if dist > RENDER_DIST then
+		step = 0
+	elseif dist < LOD1 then
+		step = 1
+	elseif dist < LOD2 then
+		step = 2
+	elseif dist < LOD3 then
+		step = 4
+	else
+		step = 8
+	end
+	rs.wantStep = step
+	rs.wantFull = dist < DATA_DISTANCE or (t - chunk.lastNeeded) < 3
+	plannedSet[chunk] = true
+	table.insert(planned, chunk)
+	if not full and dist < LOD2 and next(chunk.coarse) ~= nil then
+		table.insert(scanFar, chunk)
+	end
+end
+
 local function plan()
 	local t = now()
-	local halfSpan = CHUNK_SPAN * 0.5
-	local all: { Chunk } = {}
-	for _, chunk in field.chunks do
-		local rs = getState(chunk)
-		local cxw, czw = field:chunkCenter(chunk)
-		local dx = math.max(math.abs(camPos.X - cxw) - halfSpan, 0)
-		local dz = math.max(math.abs(camPos.Z - czw) - halfSpan, 0)
-		local lo, hi = camPos.Y, camPos.Y
-		local full = chunk.full
-		if full then
-			lo, hi = full.minY, full.maxY
-		else
-			for _, g in chunk.coarse do
-				lo, hi = g.minY, g.maxY
-				break
+	table.clear(scanFar)
+	table.clear(planned)
+	table.clear(plannedSet)
+
+	-- every chunk within reach of the camera...
+	local reach = RENDER_DIST + CHUNK_SPAN
+	local cx0, cx1 = field:chunkRange(camPos.X - reach, camPos.X + reach)
+	local cz0, cz1 = field:chunkRange(camPos.Z - reach, camPos.Z + reach)
+	if (cx1 - cx0 + 1) * (cz1 - cz0 + 1) <= 20000 then
+		for cz = cz0, cz1 do
+			for cx = cx0, cx1 do
+				local chunk = field:getChunk(cx, cz)
+				if chunk then
+					planChunk(chunk, t)
+				end
 			end
 		end
-		local dy = if camPos.Y < lo then lo - camPos.Y elseif camPos.Y > hi then camPos.Y - hi else 0
-		local dist = math.sqrt(dx * dx + dy * dy + dz * dz)
-		rs.dist = dist
-		-- chunks someone is about to step into jump the queue
-		rs.priority = if not full and (t - chunk.lastNeeded) < 3 then dist - 100000 else dist
-
-		local step
-		if dist > Config.MaxRenderDistance then
-			step = 0
-		elseif dist < LOD1 then
-			step = 1
-		elseif dist < LOD2 then
-			step = 2
-		elseif dist < LOD3 then
-			step = 4
-		else
-			step = 8
+	else
+		for _, chunk in field.chunks do
+			planChunk(chunk, t)
 		end
-		rs.wantStep = step
-		rs.wantFull = dist < DATA_DISTANCE or (t - chunk.lastNeeded) < 3
-		table.insert(all, chunk)
+	end
+	-- ...and the ones farther away that still hold something
+	for chunk in loaded do
+		if not alive(chunk) then
+			loaded[chunk] = nil
+		elseif not plannedSet[chunk] then
+			planChunk(chunk, t)
+		end
 	end
 
 	if useParts then
-		applyPartBudget(all)
+		local drawn = {}
+		for _, chunk in planned do
+			if (chunk.render :: RenderState).wantStep > 0 then
+				table.insert(drawn, chunk)
+			end
+		end
+		applyPartBudget(drawn, t)
 	end
 
 	local list = {}
-	for _, chunk in all do
+	for _, chunk in planned do
 		local rs = chunk.render :: RenderState
 		local full = chunk.full
 		if rs.wantStep == 0 and rs.mesh and not rs.building then
@@ -826,7 +1020,7 @@ local function plan()
 		end
 		-- far beyond the render distance: forget the low-detail surface too
 		-- (not when it is only held back by the Parts budget, it would just be sampled again)
-		if rs.dist > Config.MaxRenderDistance and not full then
+		if rs.dist > RENDER_DIST and not full and next(chunk.coarse) ~= nil then
 			chunk.coarse = {}
 		end
 		-- forget simulations that are far away and fully regrown
@@ -839,10 +1033,13 @@ local function plan()
 		if needsWork(chunk, rs) then
 			table.insert(list, chunk)
 		end
+		if rs.mesh or rs.building or chunk.full or next(chunk.coarse) ~= nil or rs.wantFull then
+			loaded[chunk] = true
+		else
+			loaded[chunk] = nil
+		end
 	end
-	table.sort(list, function(a: Chunk, b: Chunk)
-		return (a.render :: RenderState).priority < (b.render :: RenderState).priority
-	end)
+	table.sort(list, byPriority)
 	workList = list
 end
 
@@ -999,15 +1196,8 @@ local function applySlowdown(dt: number, framePen: number)
 end
 
 ------------------------------------------------------------------------ deformers
-local function pressPart(part: BasePart, kind: number, t: number, collect: boolean): boolean
-	local size = part.Size
-	local px, py, pz, r00, r01, r02, r10, r11, r12, r20, r21, r22 = part.CFrame:GetComponents()
-	-- broken physics (NaN) or a part flung far away: ignore it
-	if not (math.abs(px) < 1e6 and math.abs(py) < 1e6 and math.abs(pz) < 1e6) then
-		return false
-	end
-	Shapes.set(shape, kind, px, py, pz, r00, r01, r02, r10, r11, r12, r20, r21, r22, size.X, size.Y, size.Z)
-
+-- Presses the shape currently in `shape` into the snow.
+local function pressShape(t: number, collect: boolean): boolean
 	-- broad phase: is there simulated snow under this shape that reaches up to it?
 	local reach = false
 	local cx0, cx1 = field:chunkRange(shape.minX, shape.maxX)
@@ -1020,7 +1210,7 @@ local function pressPart(part: BasePart, kind: number, t: number, collect: boole
 				if full then
 					if shape.minY < full.maxY then
 						reach = true
-						chunk.lastNeeded = t
+						need(chunk, t)
 					end
 				else
 					-- not simulated yet: ask the loader for it if we might touch it
@@ -1030,7 +1220,7 @@ local function pressPart(part: BasePart, kind: number, t: number, collect: boole
 						break
 					end
 					if near then
-						chunk.lastNeeded = t
+						need(chunk, t)
 					end
 				end
 			end
@@ -1046,16 +1236,108 @@ local function pressPart(part: BasePart, kind: number, t: number, collect: boole
 	return field:stamp(shape, 0, t, nil, nil)
 end
 
+-- something resting in the snow is pressed again this often (before its dent starts to regrow)
+local REPRESS = math.clamp(Config.RegrowDelay * 0.5, 0, 1)
+
+-- A new `last` record for pressPart.
+local function newLast(): { number }
+	-- 1-4: x, y, z, time of the previous call; 5: time of the last real press;
+	-- 6-14: position and rotation at that press; 15: simEpoch at that press
+	return { 0, 0, 0, -math.huge, -math.huge, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1 }
+end
+
+-- Did the part stay where it was last pressed (a standing player's feet)?
+local function samePose(
+	last: { number },
+	px: number,
+	py: number,
+	pz: number,
+	r00: number,
+	r01: number,
+	r02: number,
+	r10: number,
+	r11: number,
+	r12: number
+): boolean
+	return math.abs(px - last[6]) < 0.005
+		and math.abs(py - last[7]) < 0.005
+		and math.abs(pz - last[8]) < 0.005
+		and math.abs(r00 - last[9]) < 0.002
+		and math.abs(r01 - last[10]) < 0.002
+		and math.abs(r02 - last[11]) < 0.002
+		and math.abs(r10 - last[12]) < 0.002
+		and math.abs(r11 - last[13]) < 0.002
+		and math.abs(r12 - last[14]) < 0.002
+end
+
+--[[
+	Presses `part` into the snow at its current pose. `last` (see newLast) remembers its previous
+	press: when it moved further than about half its own width since then (fast objects, low frame
+	rates), it is also pressed in between, so it leaves a continuous trail, not a row of dents. A
+	part resting where it was pressed is only pressed again once a second (keeps its dent fresh).
+	Returns whether a press at the current pose touched snow (`stats` then describes it).
+]]
+local function pressPart(part: BasePart, kind: number, t: number, collect: boolean, last: { number }?): boolean
+	local size = part.Size
+	local px, py, pz, r00, r01, r02, r10, r11, r12, r20, r21, r22 = part.CFrame:GetComponents()
+	-- broken physics (NaN) or a part flung far away: ignore it
+	if not (math.abs(px) < 1e6 and math.abs(py) < 1e6 and math.abs(pz) < 1e6) then
+		return false
+	end
+	if
+		last
+		and t - last[5] < REPRESS
+		and last[15] == simEpoch
+		and samePose(last, px, py, pz, r00, r01, r02, r10, r11, r12)
+	then
+		last[1], last[2], last[3], last[4] = px, py, pz, t
+		return false
+	end
+	local sx, sy, sz = size.X, size.Y, size.Z
+	Shapes.set(shape, kind, px, py, pz, r00, r01, r02, r10, r11, r12, r20, r21, r22, sx, sy, sz)
+	local width = math.min(shape.maxX - shape.minX, shape.maxZ - shape.minZ)
+	local hit = pressShape(t, collect)
+	if last then
+		local lx, ly, lz = last[1], last[2], last[3]
+		local dx, dy, dz = px - lx, py - ly, pz - lz
+		local gap = math.sqrt(dx * dx + dz * dz)
+		local spacing = math.max(0.6 * width, 0.25)
+		-- (not after a teleport or a long pause)
+		if t - last[4] < 0.25 and gap > spacing and gap < 16 then
+			local n = math.min(math.ceil(gap / spacing) - 1, 6)
+			for k = 1, n do
+				local f = k / (n + 1)
+				Shapes.set(shape, kind, lx + dx * f, ly + dy * f, lz + dz * f, r00, r01, r02, r10, r11, r12, r20, r21, r22, sx, sy, sz)
+				pressShape(t, false)
+			end
+		end
+		last[1], last[2], last[3], last[4] = px, py, pz, t
+		last[5], last[6], last[7], last[8] = t, px, py, pz
+		last[9], last[10], last[11], last[12], last[13], last[14] = r00, r01, r02, r10, r11, r12
+		last[15] = simEpoch
+	end
+	return hit
+end
+
 local function refreshCharParts(info: CharInfo)
 	local list, kinds = {}, {}
+	local rootPart = info.humanoid.RootPart
 	for _, child in info.model:GetChildren() do
-		if child:IsA("BasePart") and child.Name ~= "HumanoidRootPart" then
+		if child:IsA("BasePart") and child.Name ~= "HumanoidRootPart" and child ~= rootPart then
 			table.insert(list, child)
 			table.insert(kinds, shapeKind(child))
 		end
 	end
 	info.parts = list
 	info.kinds = kinds
+	-- forget parts that left the character
+	for part in info.lastPress do
+		if part.Parent ~= info.model then
+			info.lastPress[part] = nil
+			info.fxCooldown[part] = nil
+			info.lastSent[part] = nil
+		end
+	end
 	local root = info.model:FindFirstChild("HumanoidRootPart")
 	info.root = if root and root:IsA("BasePart") then root else info.humanoid.RootPart
 end
@@ -1095,6 +1377,7 @@ local function trackHumanoid(humanoid: Humanoid)
 		conns = {},
 		fxCooldown = {},
 		lastSent = {},
+		lastPress = {},
 	}
 	characters[model] = info
 	refreshCharParts(info)
@@ -1137,17 +1420,34 @@ local function isCharacterPart(part: BasePart): boolean
 	return false
 end
 
+-- tagged models: parts added later (or streamed back in) are deformers too
+local taggedConns: { [Instance]: RBXScriptConnection } = {}
+
 local function addTagged(inst: Instance)
 	local function add(p: BasePart)
 		local d = deformers[p]
 		if d then
 			d.tagged = true
 		else
-			deformers[p] = { kind = shapeKind(p), lastCF = nil, lastSize = nil, lastStamp = 0, lastSeen = math.huge, tagged = true }
+			deformers[p] = {
+				kind = shapeKind(p),
+				last = newLast(),
+				lastCF = nil,
+				lastSize = nil,
+				lastStamp = 0,
+				lastSeen = math.huge,
+				tagged = true,
+			}
 		end
 	end
 	if inst:IsA("BasePart") then
 		add(inst)
+	elseif not taggedConns[inst] then
+		taggedConns[inst] = inst.DescendantAdded:Connect(function(d)
+			if d:IsA("BasePart") then
+				add(d)
+			end
+		end)
 	end
 	for _, d in inst:GetDescendants() do
 		if d:IsA("BasePart") then
@@ -1157,6 +1457,11 @@ local function addTagged(inst: Instance)
 end
 
 local function removeTagged(inst: Instance)
+	local conn = taggedConns[inst]
+	if conn then
+		conn:Disconnect()
+		taggedConns[inst] = nil
+	end
 	local function remove(p: BasePart)
 		local d = deformers[p]
 		if d then
@@ -1174,35 +1479,60 @@ local function removeTagged(inst: Instance)
 	end
 end
 
--- Finds unanchored parts touching simulated snow (5x per second).
+-- Looks for unanchored parts in the snow layer of one chunk (between minY and maxY).
+local function scanChunk(chunk: Chunk, minY: number, maxY: number, t: number)
+	local maxSize = Config.MaxDeformerSize
+	local cxw, czw = field:chunkCenter(chunk)
+	local dx, dz = cxw - camPos.X, czw - camPos.Z
+	if dx * dx + dz * dz < SIM_DIST2 then
+		local h = maxY - minY + 1
+		local found = Workspace:GetPartBoundsInBox(
+			CFrame.new(cxw, (minY + maxY) * 0.5, czw),
+			Vector3.new(CHUNK_SPAN, h, CHUNK_SPAN),
+			overlapParams
+		)
+		for _, p in found do
+			local d = deformers[p]
+			if d then
+				d.lastSeen = t
+			elseif not p.Anchored and not isCharacterPart(p) then
+				local s = p.Size
+				if math.max(s.X, s.Y, s.Z) <= maxSize and not hasTagUpTo(p, Config.IgnoreTag, Workspace) then
+					deformers[p] = {
+						kind = shapeKind(p),
+						last = newLast(),
+						lastCF = nil,
+						lastSize = nil,
+						lastStamp = 0,
+						lastSeen = t,
+						tagged = false,
+					}
+				end
+			end
+		end
+	end
+end
+
+-- Finds unanchored parts touching the snow: every simulated chunk, plus a few of the drawn but
+-- not simulated chunks a little farther away (a part found there wakes up their simulation).
 local function scanDynamic(t: number)
 	if not Config.DeformByUnanchoredParts then
 		return
 	end
-	local maxSize = Config.MaxDeformerSize
 	for chunk in simChunks do
 		local full = chunk.full
 		if full and full.snowCount > 0 and alive(chunk) then
-			local cxw, czw = field:chunkCenter(chunk)
-			local dx, dz = cxw - camPos.X, czw - camPos.Z
-			if dx * dx + dz * dz < SIM_DIST2 then
-				local h = full.maxY - full.minY + 1
-				local found = Workspace:GetPartBoundsInBox(
-					CFrame.new(cxw, (full.minY + full.maxY) * 0.5, czw),
-					Vector3.new(CHUNK_SPAN, h, CHUNK_SPAN),
-					overlapParams
-				)
-				for _, p in found do
-					local d = deformers[p]
-					if d then
-						d.lastSeen = t
-					elseif not p.Anchored and not isCharacterPart(p) then
-						local s = p.Size
-						if math.max(s.X, s.Y, s.Z) <= maxSize and not hasTagUpTo(p, Config.IgnoreTag, Workspace) then
-							deformers[p] = { kind = shapeKind(p), lastCF = nil, lastSize = nil, lastStamp = 0, lastSeen = t, tagged = false }
-						end
-					end
-				end
+			scanChunk(chunk, full.minY, full.maxY, t)
+		end
+	end
+	local n = #scanFar
+	for _ = 1, math.min(n, 6) do
+		scanFarIndex = scanFarIndex % n + 1
+		local chunk = scanFar[scanFarIndex]
+		if alive(chunk) and not chunk.full then
+			for _, g in chunk.coarse do
+				scanChunk(chunk, g.minY, g.maxY + 2, t)
+				break
 			end
 		end
 	end
@@ -1268,9 +1598,10 @@ local function stepDeformers(t: number, dt: number)
 			local dx, dy, dz = pos.X - camPos.X, pos.Y - camPos.Y, pos.Z - camPos.Z
 			local d2 = dx * dx + dy * dy + dz * dz
 			local isLocal = model == localChar
-			info.simulated = isLocal or d2 < SIM_DIST2
+			info.simulated = isLocal or d2 < CHAR_SIM_DIST2
 			if info.simulated then
 				-- warm up the snow around them before they step into it
+				local snowTop = -math.huge -- highest simulated snow (rims included) around them
 				local cx0, cx1 = field:chunkRange(pos.X - 10, pos.X + 10)
 				local cz0, cz1 = field:chunkRange(pos.Z - 10, pos.Z + 10)
 				for cz = cz0, cz1 do
@@ -1279,14 +1610,37 @@ local function stepDeformers(t: number, dt: number)
 						if chunk then
 							local full = chunk.full
 							if not full or pos.Y - 8 < full.maxY then
-								chunk.lastNeeded = t
+								need(chunk, t)
+							end
+							if full and full.maxY > snowTop then
+								snowTop = full.maxY
 							end
 						end
 					end
 				end
 				local nearFx = d2 < FX_DIST2
 				for k, part in info.parts do
-					if part.Parent and pressPart(part, info.kinds[k], t, true) then
+					local last = info.lastPress[part]
+					if not last then
+						last = newLast()
+						info.lastPress[part] = last
+					end
+					local pressed = false
+					if part.Parent then
+						-- arms, head, torso... far above the snow: skip the exact shape test
+						local p, s = part.Position, part.Size
+						local hx, hz = p.X - pos.X, p.Z - pos.Z
+						-- (invisible parts: hitboxes and helpers welded to the character)
+						if
+							(p.Y - 0.5 * s.Magnitude > snowTop and hx * hx + hz * hz < 64)
+							or part.Transparency >= 0.99
+						then
+							last[1], last[2], last[3], last[4] = p.X, p.Y, p.Z, t
+						else
+							pressed = pressPart(part, info.kinds[k], t, true, last)
+						end
+					end
+					if pressed then
 						local vol = stats.volume * areaScale
 						if isLocal then
 							if stats.maxPen > framePen then
@@ -1318,23 +1672,30 @@ local function stepDeformers(t: number, dt: number)
 	for p, d in deformers do
 		if not p.Parent or (not d.tagged and t - d.lastSeen > 0.6) then
 			deformers[p] = nil
+		elseif d.tagged and not p:IsDescendantOf(Workspace) then
+			-- a tagged tool in a backpack, a template in ReplicatedStorage...: not in the world
+			d.lastCF = nil
+			d.last[4], d.last[5] = -math.huge, -math.huge
 		else
 			local cf = p.CFrame
 			local size = p.Size
-			-- a resting object only needs re-pressing once a second (keeps its dent from regrowing)
-			if cf ~= d.lastCF or size ~= d.lastSize or t - d.lastStamp > 1 then
+			-- a resting object only needs re-pressing now and then (keeps its dent from regrowing)
+			if cf ~= d.lastCF or size ~= d.lastSize or t - d.lastStamp > REPRESS then
 				local pos = cf.Position
 				local dx, dz = pos.X - camPos.X, pos.Z - camPos.Z
 				if dx * dx + dz * dz < SIM_DIST2 then
 					d.lastCF, d.lastSize, d.lastStamp = cf, size, t
 					local collect = Config.FootstepParticles
-					if pressPart(p, d.kind, t, collect) and collect then
+					if pressPart(p, d.kind, t, collect, d.last) and collect then
 						local vol = stats.volume * areaScale
 						if vol > 0.08 and stats.count > 0 and dx * dx + dz * dz < FX_DIST2 then
 							puff(contactPoint(), math.min(vol, 1))
 						end
 					end
 				end
+			else
+				-- resting where it was last pressed: that press is as good as a fresh one
+				d.last[4] = t
 			end
 		end
 	end
@@ -1354,19 +1715,32 @@ local function pokeNeighbor(chunk: Chunk, dcx: number, dcz: number, ni: number)
 	end
 end
 
-local function flushMeshes()
+local spareDirty: { [number]: number }? = {}
+
+local function flushMeshes(t: number)
 	local C = CHUNK_CELLS
 	local n = C + 1
 	local tint = Config.PackedSnowTint
+	local lowEnd = tierIndex <= 2
 	for chunk in simChunks do
 		if not alive(chunk) or not chunk.full then
 			simChunks[chunk] = nil
 		elseif chunk.dirtyCount > 0 then
-			local dirty = chunk.dirty
-			chunk.dirty = {}
-			chunk.dirtyCount = 0
 			local rs = chunk.render :: RenderState?
 			local mesh = rs and rs.mesh
+			-- snow farther away (and all snow on weak devices) is redrawn at most 20x a second;
+			-- its changes keep collecting in chunk.dirty meanwhile
+			if rs and mesh and (mesh.step >= 2 or lowEnd) and t - rs.lastFlush < 0.05 then
+				continue
+			end
+			if rs then
+				rs.lastFlush = t
+			end
+			local dirty = chunk.dirty
+			-- (reuse last flush's table; taken first so an error below can never share it)
+			chunk.dirty = spareDirty or {}
+			spareDirty = nil
+			chunk.dirtyCount = 0
 			if mesh and mesh.usesFull then
 				local ok, err = pcall(mesh.applyDirty :: any, mesh, field, chunk, dirty, false, tint)
 				if not ok then
@@ -1393,6 +1767,8 @@ local function flushMeshes()
 					end
 				end
 			end
+			table.clear(dirty)
+			spareDirty = dirty
 		end
 	end
 end
@@ -1403,25 +1779,13 @@ local function stepRegrow(t: number)
 	end
 	for chunk in simChunks do
 		local full = chunk.full
-		if full and full.activeCount > 0 and t - full.lastRegrow >= 0.25 then
+		if full and full.activeCount > 0 and t - full.lastRegrow >= REGROW_INTERVAL then
 			field:regrow(chunk, t)
 		end
 	end
 end
 
 ------------------------------------------------------------------------ networking
-local function maxPrintAge(): number?
-	if Config.RegrowSpeed <= 0 then
-		return nil
-	end
-	local deepest = Config.SnowDepth
-	for _, info in parts do
-		if info.depth > deepest then
-			deepest = info.depth
-		end
-	end
-	return Config.RegrowDelay + deepest * (1 + Config.RimRatio) / Config.RegrowSpeed + 1
-end
 
 local function isSimulatedLocally(userId: number): boolean
 	local plr = Players:GetPlayerByUserId(userId)
@@ -1489,6 +1853,7 @@ end
 
 ------------------------------------------------------------------------ quality & preloading
 local prewarming = false
+local settleUntil = 0 -- the frame-rate watcher waits while a quality change is being applied
 
 -- Creates the Parts the renderer will need ahead of time, a little every frame.
 local function prewarmPool()
@@ -1514,19 +1879,46 @@ local function applyTier(index: number)
 	local smooth = math.max(0.005, Config.PartsSmoothness * tier.smoothness)
 	if style.smoothness ~= smooth then
 		style.smoothness = smooth
-		styleVersion += 1 -- chunks are re-triangulated one by one in the background
+		styleVersion += 1
+		-- chunks without triangles only need the new setting (no Part changes); the others are
+		-- re-triangulated in place, one by one in the background
+		for chunk in loaded do
+			local rs = chunk.render :: RenderState?
+			local mesh = rs and rs.mesh
+			local restyle = mesh and mesh.restyle
+			if rs and mesh and restyle and not rs.building and (mesh.wedgeCount or 0) == 0 then
+				restyle(mesh, chunk, smooth, nil)
+				rs.styleVersion = styleVersion
+			end
+		end
+		settleUntil = now() + 15
 	end
 	local shadows = Config.CastShadow and tier.shadows
 	if style.castShadow ~= shadows then
+		-- pooled Parts pick up the setting when they are reused; the drawn ones are switched a
+		-- few chunks per frame (thousands of Parts at once would be a hitch on a slow device)
 		style.castShadow = shadows
-		ChunkParts.setPoolShadows(shadows)
-		for _, chunk in field.chunks do
-			local rs = chunk.render :: RenderState?
-			local mesh = rs and rs.mesh :: any
-			if mesh and mesh.setShadows then
-				mesh:setShadows(shadows)
-			end
+		local list = {}
+		for chunk in loaded do
+			table.insert(list, chunk)
 		end
+		task.spawn(function()
+			local started = os.clock()
+			for _, chunk in list do
+				if style.castShadow ~= shadows or stopped then
+					return
+				end
+				local rs = chunk.render :: RenderState?
+				local mesh = rs and rs.mesh
+				if mesh then
+					mesh:setShadows(shadows)
+				end
+				if os.clock() - started > 0.002 then
+					RunService.Heartbeat:Wait()
+					started = os.clock()
+				end
+			end
+		end)
 	end
 	renderFolder:SetAttribute("SnowQuality", tier.name)
 	task.spawn(prewarmPool)
@@ -1536,22 +1928,120 @@ local function applyTier(index: number)
 end
 
 local readySent = false
+local readyDeadline = math.huge
 
--- Sets Workspace.DeformableSnowRender's "SnowReady" attribute once the snow around the camera is
--- built (a loading screen can wait for it), and ends the heavier preloading.
+-- Sets Workspace.DeformableSnowRender's "SnowReady" attribute once the snow around the player is
+-- drawn (a loading screen can wait for it), and ends the heavier preloading.
 local function checkReady()
 	if readySent or not partsReady then
 		return
 	end
-	for _, chunk in field.chunks do
-		local rs = chunk.render :: RenderState?
-		if rs and rs.dist < LOD1 and (rs.building or needsWork(chunk, rs)) then
-			return
+	local t = now()
+	-- (a loading screen must never wait forever: after the deadline it is "ready" anyway)
+	if t < readyDeadline then
+		if t - lastTracked < 0.5 then
+			return -- snow parts are still arriving (StreamingEnabled)
+		end
+		local char = localPlayer and localPlayer.Character
+		local root = char and char:FindFirstChild("HumanoidRootPart")
+		if not (root and root:IsA("BasePart")) or (root.Position - camPos).Magnitude > 60 then
+			return -- not spawned yet, or the camera is not at the character yet
+		end
+		for _, chunk in planned do
+			local rs = chunk.render :: RenderState?
+			if rs and rs.dist < LOD1 and rs.wantStep > 0 then
+				local mesh = rs.mesh
+				local drawn = (mesh ~= nil and mesh.step == rs.wantStep)
+					or (rs.emptyVersion == chunk.gridVersion and rs.emptyStep == rs.wantStep)
+				if not drawn then
+					return
+				end
+			end
 		end
 	end
 	readySent = true
 	renderFolder:SetAttribute("SnowReady", true)
-	preloadUntil = math.min(preloadUntil, now() + 1)
+	preloadUntil = math.min(preloadUntil, t + 1)
+end
+
+------------------------------------------------------------------------ the SnowParts folder
+local folderConns: { RBXScriptConnection } = {}
+
+-- Forgets kept prints that have regrown by now (every few seconds).
+local function pruneKeptPrints()
+	local t = now()
+	local age = maxPrintAge() or 300
+	for key, d in detached do
+		if t - d.time > age then
+			detached[key] = nil
+		end
+	end
+	field:pruneOrphans(t)
+end
+
+-- Forgets every snow part (the SnowParts folder was removed, e.g. a round-based game changing maps).
+local function dropFolder()
+	for _, c in folderConns do
+		c:Disconnect()
+	end
+	table.clear(folderConns)
+	local list = {}
+	for part in parts do
+		table.insert(list, part)
+	end
+	for _, part in list do
+		untrackPart(part)
+	end
+	table.clear(refreshQueue)
+	-- a different map: old prints do not belong on it
+	table.clear(detached)
+	snowFolder = nil
+end
+
+-- Puts snow on everything in this folder, and keeps following it.
+function useFolder(sf: Instance)
+	if snowFolder == sf then
+		return
+	end
+	if snowFolder then
+		dropFolder()
+	end
+	snowFolder = sf
+	overlapParams.FilterDescendantsInstances = { renderFolder, sf }
+	for _, d in sf:GetDescendants() do
+		if d:IsA("BasePart") then
+			trackPart(d)
+		end
+	end
+	table.insert(
+		folderConns,
+		sf.DescendantAdded:Connect(function(d)
+			if d:IsA("BasePart") then
+				trackPart(d)
+			end
+		end)
+	)
+	table.insert(
+		folderConns,
+		sf.DescendantRemoving:Connect(function(d)
+			if d:IsA("BasePart") then
+				untrackPart(d)
+			end
+		end)
+	)
+	-- (removing the folder itself fires no DescendantRemoving for what is inside it)
+	table.insert(
+		folderConns,
+		sf.AncestryChanged:Connect(function()
+			if snowFolder == sf and not sf:IsDescendantOf(Workspace) then
+				dropFolder()
+				local other = Workspace:FindFirstChild(Config.SnowFolderName)
+				if other then
+					useFolder(other)
+				end
+			end
+		end)
+	)
 end
 
 ------------------------------------------------------------------------ start
@@ -1575,7 +2065,8 @@ function SnowClient.start()
 		rimWidth = math.max(0.01, Config.RimWidth),
 		regrowDelay = math.max(0, Config.RegrowDelay),
 		regrowSpeed = math.max(0, Config.RegrowSpeed),
-		maxPendingPerChunk = 2000,
+		maxPendingPerChunk = 600,
+		maxPendingAge = maxPrintAge(),
 	})
 
 	local folder = Instance.new("Folder")
@@ -1614,51 +2105,44 @@ function SnowClient.start()
 			warn(`[DeformableSnow] waiting for Workspace.{Config.SnowFolderName} (put your snow parts in it)`)
 			f = Workspace:WaitForChild(Config.SnowFolderName)
 		end
-		local sf = f :: Instance
-		snowFolder = sf
-		overlapParams.FilterDescendantsInstances = { renderFolder, sf }
-		for _, d in sf:GetDescendants() do
-			if d:IsA("BasePart") then
-				trackPart(d)
-			end
+		if not snowFolder then
+			useFolder(f :: Instance)
 		end
 		partsReady = true
 		-- preload: build the snow around the camera quickly and get Parts ready before anyone walks
 		preloadUntil = now() + math.max(0, Config.PreloadSeconds)
+		readyDeadline = now() + math.max(0, Config.PreloadSeconds) + 10
 		task.spawn(prewarmPool)
-		sf.DescendantAdded:Connect(function(d)
-			if d:IsA("BasePart") then
-				trackPart(d)
-			end
-		end)
-		sf.DescendantRemoving:Connect(function(d)
+	end)
+	-- a new map: a new SnowParts folder (the old one was removed, see useFolder)
+	Workspace.ChildAdded:Connect(function(child)
+		if child.Name == Config.SnowFolderName and snowFolder == nil and partsReady then
+			useFolder(child)
+		end
+	end)
+	CollectionService:GetInstanceAddedSignal(Config.IgnoreTag):Connect(function(inst: Instance)
+		if inst:IsA("BasePart") then
+			untrackPart(inst)
+		end
+		for _, d in inst:GetDescendants() do
 			if d:IsA("BasePart") then
 				untrackPart(d)
 			end
-		end)
-		CollectionService:GetInstanceAddedSignal(Config.IgnoreTag):Connect(function(inst: Instance)
-			if inst:IsA("BasePart") then
-				untrackPart(inst)
+		end
+	end)
+	CollectionService:GetInstanceRemovedSignal(Config.IgnoreTag):Connect(function(inst: Instance)
+		local sf = snowFolder
+		if not sf or not inst:IsDescendantOf(sf) then
+			return
+		end
+		if inst:IsA("BasePart") then
+			trackPart(inst)
+		end
+		for _, d in inst:GetDescendants() do
+			if d:IsA("BasePart") then
+				trackPart(d)
 			end
-			for _, d in inst:GetDescendants() do
-				if d:IsA("BasePart") then
-					untrackPart(d)
-				end
-			end
-		end)
-		CollectionService:GetInstanceRemovedSignal(Config.IgnoreTag):Connect(function(inst: Instance)
-			if not inst:IsDescendantOf(sf) then
-				return
-			end
-			if inst:IsA("BasePart") then
-				trackPart(inst)
-			end
-			for _, d in inst:GetDescendants() do
-				if d:IsA("BasePart") then
-					trackPart(d)
-				end
-			end
-		end)
+		end
 	end)
 
 	-- characters & NPCs
@@ -1680,15 +2164,40 @@ function SnowClient.start()
 	CollectionService:GetInstanceAddedSignal(Config.DeformerTag):Connect(addTagged)
 	CollectionService:GetInstanceRemovedSignal(Config.DeformerTag):Connect(removeTagged)
 
+	-- (re)spawning: build the snow around the new spot quickly again
+	if localPlayer then
+		localPlayer.CharacterAdded:Connect(function()
+			if partsReady then
+				preloadUntil = math.max(preloadUntil, now() + math.max(0, Config.PreloadSeconds))
+			end
+		end)
+	end
+
 	task.spawn(connectRemote)
 	task.spawn(workerLoop)
 
-	local planTimer, scanTimer, sendTimer, debugTimer = 0, 0, 0, 0
+	local planTimer, scanTimer, sendTimer, debugTimer, pruneTimer = 0, 0, 0, 0, 0
 	local frame, deformDt = 0, 0
 	-- climbs back up after a slowdown, but never above the player's own graphics setting, and a
 	-- phone never goes to High
-	local maxTier = if DEVICE.graphicsLevel then START_TIER elseif DEVICE.touchOnly then 3 else 4
-	local monitor = Quality.newMonitor(START_TIER, math.max(START_TIER, maxTier), FORCED_TIER ~= nil)
+	local deviceCap = if DEVICE.touchOnly then 3 else 4
+	local graphicsCap = if DEVICE.graphicsLevel
+		then Quality.initialTier({ touchOnly = false, console = false, graphicsLevel = DEVICE.graphicsLevel })
+		else 4
+	local maxTier = math.max(START_TIER, math.min(deviceCap, graphicsCap))
+	local monitor = Quality.newMonitor(START_TIER, maxTier, FORCED_TIER ~= nil)
+	-- a minimized / unfocused game runs slower for reasons that have nothing to do with the snow
+	local focused = true
+	pcall(function()
+		local uis = game:GetService("UserInputService")
+		uis.WindowFocusReleased:Connect(function()
+			focused = false
+		end)
+		uis.WindowFocused:Connect(function()
+			focused = true
+			monitor.warmup = math.max(monitor.warmup, 3)
+		end)
+	end)
 	local lastError: string? = nil
 	-- runs one piece of the frame update; an unexpected error is reported once instead of every frame
 	local function protected(fn: (...any) -> (), ...: any)
@@ -1717,9 +2226,16 @@ function SnowClient.start()
 			deformDt = 0
 		end
 		protected(stepRegrow, t)
-		protected(flushMeshes)
+		protected(flushMeshes, t)
 
-		local newTier = Quality.step(monitor, dt)
+		-- the extra loading work right after joining, or after a quality change, is not a reason to
+		-- lower the quality (again)
+		if not partsReady or t < preloadUntil then
+			monitor.warmup = math.max(monitor.warmup, 1)
+		elseif t < settleUntil and #workList > 0 then
+			monitor.cooldown = math.max(monitor.cooldown, 0.5)
+		end
+		local newTier = if focused then Quality.step(monitor, dt) else nil
 		if newTier then
 			protected(applyTier, newTier)
 		end
@@ -1740,6 +2256,11 @@ function SnowClient.start()
 		if sendTimer >= 0.25 then
 			sendTimer = 0
 			protected(flushOutbox)
+		end
+		pruneTimer += dt
+		if pruneTimer >= 5 then
+			pruneTimer = 0
+			protected(pruneKeptPrints)
 		end
 		if Config.Debug then
 			debugTimer += dt

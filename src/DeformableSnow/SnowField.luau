@@ -50,6 +50,8 @@ export type Params = {
 	regrowDelay: number,
 	regrowSpeed: number,
 	maxPendingPerChunk: number,
+	-- queued prints older than this (seconds) have regrown and are dropped (nil = keep)
+	maxPendingAge: number?,
 }
 
 -- (x, z) -> surfaceY (nil = no snow part here), surface normal Y, snow depth for that part
@@ -116,6 +118,8 @@ export type SnowField = typeof(setmetatable(
 		params: Params,
 		chunks: { [number]: Chunk },
 		chunkCount: number,
+		-- prints for chunks that do not exist (yet): their snow parts have not streamed in
+		orphans: { [number]: { Pending } },
 	},
 	SnowField
 ))
@@ -152,6 +156,7 @@ function SnowField.new(params: Params): SnowField
 		params = params,
 		chunks = {},
 		chunkCount = 0,
+		orphans = {},
 	}, SnowField)
 	return self
 end
@@ -198,10 +203,12 @@ function SnowField.addRegion(self: SnowField, minX: number, maxX: number, minZ: 
 					dirtyCount = 0,
 					version = 0,
 					stale = false,
-					pending = nil,
+					-- prints that arrived before this chunk's snow part did
+					pending = self.orphans[key],
 					lastNeeded = -math.huge,
 					render = nil,
 				}
+				self.orphans[key] = nil
 				self.chunks[key] = chunk
 				self.chunkCount += 1
 			end
@@ -431,7 +438,7 @@ end
 	Makes a chunk deformable using a step-1 grid. If the chunk was already simulated (re-sample after
 	a part moved) existing prints/rims are carried over relative to the new rest surface.
 ]]
-function SnowField.attachFull(self: SnowField, chunk: Chunk, grid: Grid, now: number)
+function SnowField.attachFull(self: SnowField, chunk: Chunk, grid: Grid, now: number, budget: (() -> ())?)
 	assert(grid.step == 1, "full grids must be sampled at step 1")
 	local p = self.params
 	local count = grid.n * grid.n
@@ -487,8 +494,18 @@ function SnowField.attachFull(self: SnowField, chunk: Chunk, grid: Grid, now: nu
 	local pending = chunk.pending
 	if pending then
 		chunk.pending = nil
-		for _, item in pending do
-			self:stampAged(item.shape, now, item.hitTime, chunk)
+		-- (other players' prints made while it was not simulated; `budget` may yield in between)
+		local maxAge = p.maxPendingAge
+		for k, item in pending do
+			if not maxAge or now - item.hitTime <= maxAge then
+				self:stampAged(item.shape, now, item.hitTime, chunk)
+			end
+			if budget and k % 32 == 0 then
+				budget()
+				if chunk.full ~= full then
+					return -- dropped or re-sampled meanwhile
+				end
+			end
 		end
 	end
 end
@@ -676,6 +693,46 @@ end
 	Queues a print for chunks that are not simulated yet (late-join history / far away players) and
 	applies it right away where the chunk is simulated.
 ]]
+-- Adds a queued print, dropping regrown (too old) ones and keeping at most maxPendingPerChunk.
+local function pushPending(p: Params, list: { Pending }, item: Pending, now: number)
+	table.insert(list, item)
+	local n = #list
+	if n <= p.maxPendingPerChunk and n % 64 ~= 0 then
+		return
+	end
+	-- (in batches: never shift the whole list for every new print)
+	local maxAge = p.maxPendingAge
+	local drop = 0
+	if maxAge then
+		while drop < n and now - list[drop + 1].hitTime > maxAge do
+			drop += 1
+		end
+	end
+	if n - drop > p.maxPendingPerChunk then
+		drop = n - p.maxPendingPerChunk + p.maxPendingPerChunk // 4
+	end
+	if drop > 0 then
+		table.move(list, drop + 1, n, 1)
+		for i = n - drop + 1, n do
+			list[i] = nil
+		end
+	end
+end
+
+-- Forgets prints for chunks that never appeared once they have regrown anyway.
+function SnowField.pruneOrphans(self: SnowField, now: number)
+	local maxAge = self.params.maxPendingAge
+	if not maxAge then
+		return
+	end
+	for key, list in self.orphans do
+		local last = list[#list]
+		if not last or now - last.hitTime > maxAge then
+			self.orphans[key] = nil
+		end
+	end
+end
+
 function SnowField.queueStamp(self: SnowField, s: Shape, now: number, hitTime: number)
 	local p = self.params
 	local rimW = p.rimWidth
@@ -683,18 +740,18 @@ function SnowField.queueStamp(self: SnowField, s: Shape, now: number, hitTime: n
 	local cz0, cz1 = self:chunkRange(s.minZ - rimW, s.maxZ + rimW)
 	for cz = cz0, cz1 do
 		for cx = cx0, cx1 do
-			local chunk = self.chunks[SnowField.chunkKey(cx, cz)]
-			if chunk then
-				if chunk.full then
-					self:stampAged(s, now, hitTime, chunk)
-				else
-					local list: { Pending } = chunk.pending or {}
-					chunk.pending = list
-					table.insert(list, { shape = s, hitTime = hitTime })
-					if #list > p.maxPendingPerChunk then
-						table.remove(list, 1)
-					end
-				end
+			local key = SnowField.chunkKey(cx, cz)
+			local chunk = self.chunks[key]
+			if chunk and chunk.full then
+				self:stampAged(s, now, hitTime, chunk)
+			elseif chunk then
+				local list: { Pending } = chunk.pending or {}
+				chunk.pending = list
+				pushPending(p, list, { shape = s, hitTime = hitTime }, now)
+			else
+				local list = self.orphans[key] or {}
+				self.orphans[key] = list
+				pushPending(p, list, { shape = s, hitTime = hitTime }, now)
 			end
 		end
 	end

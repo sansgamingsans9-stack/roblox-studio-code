@@ -32,6 +32,8 @@ export type Tier = {
 	budgetMs: number,
 	-- seconds between scans for loose parts touching the snow
 	scanInterval: number,
+	-- regrowing snow rises this many drawn height steps at a time (fewer Part updates)
+	regrowSteps: number,
 	-- Parts kept ready in the pool (boxes, wedges)
 	poolBoxes: number,
 	poolWedges: number,
@@ -49,6 +51,7 @@ Quality.TIERS = {
 		deformEvery = 2,
 		budgetMs = 1.5,
 		scanInterval = 0.6,
+		regrowSteps = 4,
 		poolBoxes = 60,
 		poolWedges = 300,
 	},
@@ -63,6 +66,7 @@ Quality.TIERS = {
 		deformEvery = 2,
 		budgetMs = 2,
 		scanInterval = 0.4,
+		regrowSteps = 3,
 		poolBoxes = 100,
 		poolWedges = 600,
 	},
@@ -77,6 +81,7 @@ Quality.TIERS = {
 		deformEvery = 1,
 		budgetMs = 2.5,
 		scanInterval = 0.25,
+		regrowSteps = 1,
 		poolBoxes = 150,
 		poolWedges = 1000,
 	},
@@ -91,6 +96,7 @@ Quality.TIERS = {
 		deformEvery = 1,
 		budgetMs = 3,
 		scanInterval = 0.2,
+		regrowSteps = 1,
 		poolBoxes = 200,
 		poolWedges = 1500,
 	},
@@ -140,6 +146,14 @@ export type Monitor = {
 	-- seconds of smooth frames needed before trying a higher tier (doubles after each failed try)
 	upNeed: number,
 	lastUp: number,
+	-- the frame rate just before the last step down, and seconds since then
+	fpsAtDown: number,
+	sinceDown: number,
+	-- never step below this tier (a step down that did not help), for floorTime more seconds,
+	-- unless the frame rate falls well below floorFps (something new is slowing the game down)
+	floor: number,
+	floorTime: number,
+	floorFps: number,
 }
 
 -- Frame-rate watcher. `maxTier` caps how far it may climb (a phone never goes to High).
@@ -155,12 +169,19 @@ function Quality.newMonitor(tier: number, maxTier: number, fixed: boolean): Moni
 		warmup = 5, -- loading hitches at the start do not count
 		upNeed = 20,
 		lastUp = math.huge, -- seconds since the last step up (never)
+		fpsAtDown = 0,
+		sinceDown = math.huge,
+		floor = 1,
+		floorTime = 0,
+		floorFps = 0,
 	}
 end
 
 --[[
 	Feed one frame. Returns the new tier index when it changed, otherwise nil.
 	Steps down after ~3 s below ~38 FPS, up after ~20 s above ~55 FPS (longer after a failed try).
+	If a step down did not make the game faster, the snow is not what slows this device down
+	(a 30 FPS cap, a heavy game): it goes back up and stays there for a while.
 ]]
 function Quality.step(m: Monitor, dt: number): number?
 	if m.fixed then
@@ -170,6 +191,13 @@ function Quality.step(m: Monitor, dt: number): number?
 	-- slowness that lasts may lower the quality
 	dt = math.clamp(dt, 0, 0.1)
 	m.lastUp += dt
+	m.sinceDown += dt
+	if m.floorTime > 0 then
+		m.floorTime -= dt
+		if m.floorTime <= 0 then
+			m.floor = 1
+		end
+	end
 	if m.warmup > 0 then
 		m.warmup -= dt
 		return nil
@@ -191,9 +219,23 @@ function Quality.step(m: Monitor, dt: number): number?
 		m.lowTime = math.max(0, m.lowTime - dt)
 		m.highTime = math.max(0, m.highTime - dt)
 	end
-	if m.lowTime > 3 and m.tier > 1 then
-		m.tier -= 1
+	if m.lowTime > 3 and m.sinceDown < 25 and fps < m.fpsAtDown * 1.1 then
+		-- the last step down gained (almost) nothing: undo it and stop stepping down
 		m.lowTime, m.highTime, m.cooldown = 0, 0, 6
+		m.tier = math.min(m.tier + 1, m.maxTier)
+		m.floor, m.floorTime, m.floorFps = m.tier, 180, fps
+		m.sinceDown = math.huge
+		return m.tier
+	end
+	if m.floor > 1 and fps < m.floorFps * 0.8 then
+		m.floor, m.floorTime = 1, 0
+	elseif m.floor > 1 and m.tier <= m.floor then
+		m.lowTime = 0 -- (held at the floor: slowness while held must not count later)
+	end
+	if m.lowTime > 3 and m.tier > m.floor then
+		m.lowTime, m.highTime, m.cooldown = 0, 0, 6
+		m.tier -= 1
+		m.fpsAtDown, m.sinceDown = fps, 0
 		if m.lastUp < 60 then
 			-- the higher tier we just tried was too much: wait longer before trying it again
 			m.upNeed = math.min(m.upNeed * 2, 320)
@@ -204,6 +246,7 @@ function Quality.step(m: Monitor, dt: number): number?
 		m.tier += 1
 		m.lowTime, m.highTime, m.cooldown = 0, 0, 10
 		m.lastUp = 0
+		m.sinceDown = math.huge
 		return m.tier
 	end
 	return nil

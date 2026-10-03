@@ -183,7 +183,10 @@ function ChunkMesh.build(
 	local version = chunk.version
 	local p = field.params
 	local C, S = p.chunkCells, p.cellSize
-	local cliff = p.cliffHeight
+	-- a jump between neighbouring samples is a cliff when it is taller than CliffHeight and steeper
+	-- than snow can lie (far, coarse samples are far apart: a slope there is not a cliff)
+	local tanSlope = math.sqrt(math.max(0, 1 - p.maxSlopeCos * p.maxSlopeCos)) / math.max(p.maxSlopeCos, 1e-3)
+	local cliff = math.max(p.cliffHeight, step * S * tanSlope)
 	local nSide = C // step + 1
 	local half = C * S * 0.5
 	local minY, maxY = src.minY - 0.1, src.maxY + 0.1
@@ -468,6 +471,12 @@ function ChunkMesh.build(
 	}, ChunkMesh)
 	mp.Parent = style.parent
 	return self, nil
+end
+
+function ChunkMesh.setShadows(self: ChunkMesh, on: boolean)
+	if self.part then
+		self.part.CastShadow = on
+	end
 end
 
 function ChunkMesh.destroy(self: ChunkMesh)

@@ -110,11 +110,56 @@ T.describe("preloading", function()
 	)
 end)
 
+T.describe("a minimized game does not lower the quality", function()
+	R.UserInputService.WindowFocusReleased:Fire()
+	R.run(20, 1 / 10)
+	T.eq(quality(), "Low", "unchanged while unfocused")
+	R.UserInputService.WindowFocused:Fire()
+	R.run(1, 1 / 60)
+	T.eq(quality(), "Low", "unchanged after coming back")
+end)
+
+-- frames at a rate that depends on the current quality (the snow is what costs time)
+local function runAt(seconds, fpsByQuality)
+	local t = 0
+	while t < seconds do
+		local dt = 1 / fpsByQuality[quality()]
+		R.frame(dt)
+		t += dt
+	end
+end
+local slowPhone = { Potato = 40, Low = 20, Medium = 15 }
+
 T.describe("a slow phone steps down to Potato", function()
-	R.run(14, 1 / 20)
+	runAt(14, slowPhone)
 	T.eq(quality(), "Potato", "SnowQuality attribute")
-	R.run(1, 1 / 20)
+	runAt(20, slowPhone)
+	T.eq(quality(), "Potato", "stays: 40 FPS is fine")
 	healthy("Potato")
+end)
+
+T.describe("a fast ball leaves a continuous rut on a slow phone", function()
+	-- Potato presses every other frame: at 80 studs/s and 20 FPS that is 8 studs between presses
+	-- (this test's snow refills after 0.5 s, so the rut is checked right away)
+	local ball = I.new("Part")
+	ball.Name = "Ball"
+	ball.Shape = "Enum.PartType.Ball"
+	ball.Size = V.new(2, 2, 2)
+	ball.Anchored = false
+	ball.CFrame = CF.new(-20, 1, 12)
+	ball.Parent = R.Workspace
+	R.run(1, 1 / 20) -- found by the scan for loose parts
+	for i = 1, 10 do
+		ball.CFrame = CF.new(-20 + i * 4, 1, 12)
+		R.frame(1 / 20)
+	end
+	T.eq(quality(), "Potato", "(still Potato)")
+	local highest = -math.huge
+	for x = -14, 18, 0.25 do
+		highest = math.max(highest, R.boxTopY(x, 12) or math.huge)
+	end
+	T.ok(highest < 0.5, `no bumps left between the presses (highest point {highest})`)
+	ball:Destroy()
 end)
 
 T.describe("climbs back when the frame rate recovers, never to High on a phone", function()

@@ -303,6 +303,7 @@ Imt.__index = function(self, k)
 		or k == "OnClientEvent"
 		or k == "OnServerEvent"
 		or k == "PlayerRemoving"
+		or k == "CharacterAdded"
 	then
 		return signal(self, k)
 	end
@@ -384,6 +385,9 @@ Imt.__newindex = function(self, k, v)
 	local s = rawget(self, "_signals")["prop:" .. k]
 	if s then
 		s:Fire()
+	end
+	if k == "Character" and v ~= nil and self.ClassName == "Player" then
+		signal(self, "CharacterAdded"):Fire(v)
 	end
 end
 
@@ -845,6 +849,8 @@ end
 
 -- device facts read by the quality detection (tests change these before requiring SnowClient)
 local UserInputService = { TouchEnabled = false, KeyboardEnabled = true, MouseEnabled = true }
+UserInputService.WindowFocused = newSignal()
+UserInputService.WindowFocusReleased = newSignal()
 local GuiService = { tenFoot = false }
 function GuiService.IsTenFootInterface(self)
 	return self.tenFoot

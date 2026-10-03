@@ -275,6 +275,75 @@ T.describe("snow on parts at different heights", function()
 	r:destroy()
 end)
 
+T.describe("prints near a snow edge: solid sides, and boxes again once regrown", function()
+	local half = function(x, _z)
+		return if x <= 10.1 then 5 else nil
+	end
+	local r, field, chunk = build(half, 1)
+	local foot = Shapes.new()
+	Shapes.set(foot, Shapes.BOX, 9, 5.2, 8, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0.4, 1.2)
+	field:stamp(foot, 0, 0, nil, nil)
+	r:applyDirty(field, chunk, chunk.dirty, false, style.packedTint)
+	chunk.dirty, chunk.dirtyCount = {}, 0
+	T.near(surfaceAt(r, 9, 8), 5.06, 0.011, "print floor next to the edge")
+	-- flat triangles near the edge reach down to the ground (no thin floating sheet)
+	local thin = 0
+	for _, p in r.folder:GetChildren() do
+		if p.ClassName == "WedgePart" then
+			local top = R.wedgeTop(p)
+			local nearEdge = false
+			for _, q in top do
+				if q.X > 9.6 then
+					nearEdge = true
+				end
+			end
+			local flat = math.abs(top[1].Y - top[2].Y) < 1e-6 and math.abs(top[1].Y - top[3].Y) < 1e-6
+			if nearEdge and flat and top[1].Y > 5.9 and p.Size.X < 0.9 then
+				thin += 1
+			end
+		end
+	end
+	T.eq(thin, 0, "untouched snow at the edge keeps a full-depth side")
+
+	-- regrow completely: the tiles go back to boxes (the last bit of regrowing is invisible)
+	local t = 0
+	while chunk.full.activeCount > 0 and t < 2000 do
+		t += 0.25
+		field:regrow(chunk, t)
+		r:applyDirty(field, chunk, chunk.dirty, false, style.packedTint)
+		chunk.dirty, chunk.dirtyCount = {}, 0
+	end
+	T.eq(chunk.full.activeCount, 0, "regrown")
+	local wedges = 0
+	for _, p in r.folder:GetChildren() do
+		if p.ClassName == "WedgePart" then
+			wedges += 1
+		end
+	end
+	T.eq(wedges, 0, "no triangles left behind")
+	T.eq(r.partCount, #r.folder:GetChildren(), "part count bookkeeping")
+	r:destroy()
+end)
+
+T.describe("steep snow stays drawn far away", function()
+	-- 45 degrees, at the coarsest detail with 0.5-stud cells (4 studs between samples)
+	local coarse = table.clone(params)
+	coarse.cellSize = 0.5
+	local field = SnowField.new(coarse)
+	field:addRegion(-8, 40, -8, 40)
+	local chunk = field:getChunk(0, 0)
+	field:attachFull(chunk, field:sampleGrid(chunk, 1, function(x, _z)
+		return 5 + x, math.cos(math.rad(45)), 1
+	end, noYield), 0)
+	local r = ChunkParts.build(field, chunk, 8, style, noYield)
+	T.ok(r ~= nil and #r.folder:GetChildren() > 0, "drawn")
+	if r then
+		local y = surfaceAt(r, 13, 13)
+		T.ok(y ~= nil and math.abs(y - (5 + 13 + 1 / math.cos(math.rad(45)))) < 1.5, `on the slope ({y})`)
+		r:destroy()
+	end
+end)
+
 T.describe("pool bookkeeping", function()
 	T.eq(ChunkParts.liveCount, 0, "every Part returned to the pool after destroy")
 end)

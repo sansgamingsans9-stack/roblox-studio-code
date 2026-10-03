@@ -51,24 +51,50 @@ local function feed(m, seconds, fps)
 	return changes
 end
 
+-- like feed, but the frame rate depends on the current tier (the snow is what costs time)
+local function feedBy(m, seconds, fpsOf)
+	local changes = {}
+	local t = 0
+	while t < seconds do
+		local dt = 1 / fpsOf(m.tier)
+		t += dt
+		local new = Quality.step(m, dt)
+		if new then
+			table.insert(changes, new)
+		end
+	end
+	return changes
+end
+
 T.describe("frame-rate watcher", function()
+	-- High runs at 25 FPS, Medium at 33, Low at 45
+	local heavy = function(tier)
+		return ({ 60, 45, 33, 25 })[tier]
+	end
 	local m = Quality.newMonitor(HIGH, HIGH, false)
 	T.eq(#feed(m, 4.5, 15), 0, "loading hitches during the warm-up do not count")
 	T.eq(#feed(m, 2, 60), 0, "smooth frames: no change")
 	T.eq(#feed(m, 1.5, 25), 0, "a short slowdown is tolerated")
 	T.eq(#feed(m, 2, 60), 0, "recovers")
-	local down = feed(m, 5, 25)
+	local down = feedBy(m, 5, heavy)
 	T.eq(#down, 1, "steps down once after a few slow seconds")
 	T.eq(down[1], MEDIUM, "High -> Medium")
-	T.eq(#feed(m, 5, 25), 0, "waits (cooldown) before stepping again")
-	T.eq(feed(m, 5, 25)[1], LOW, "still slow: Medium -> Low")
-	T.eq(feed(m, 60, 20)[1], POTATO, "very slow: Low -> Potato")
-	T.eq(#feed(m, 60, 10), 0, "never below Potato")
+	T.eq(#feedBy(m, 5, heavy), 0, "waits (cooldown) before stepping again")
+	T.eq(feedBy(m, 5, heavy)[1], LOW, "still slow but it helped: Medium -> Low")
+	T.eq(#feedBy(m, 60, heavy), 0, "fast enough on Low: stays")
+	T.eq(m.tier, LOW, "settles on Low")
+
+	-- a device that is slow whatever the snow does
+	local m5 = Quality.newMonitor(LOW, HIGH, false)
+	feed(m5, 6, 60)
+	T.eq(feed(m5, 5, 20)[1], POTATO, "Low -> Potato")
+	T.eq(feed(m5, 60, 10)[1], LOW, "Potato did not help: back to Low")
+	T.eq(#feed(m5, 60, 10), 0, "and stays there")
 
 	-- a slowdown that has nothing to do with a recent step up does not delay the next one
 	local m4 = Quality.newMonitor(MEDIUM, HIGH, false)
 	feed(m4, 6, 60)
-	T.eq(feed(m4, 5, 20)[1], LOW, "slow: Medium -> Low")
+	T.eq(feedBy(m4, 5, heavy)[1], LOW, "slow: Medium -> Low")
 	T.eq(feed(m4, 30, 60)[1], MEDIUM, "back up after ~20 smooth seconds")
 
 	local m2 = Quality.newMonitor(LOW, MEDIUM, false)
@@ -88,6 +114,20 @@ T.describe("frame-rate watcher", function()
 	T.eq(changed, 0, "occasional hitches do not lower the tier")
 	-- a game that is slow all the time does
 	T.eq(feed(m3, 6, 8)[1], MEDIUM, "sustained 8 FPS lowers it")
+end)
+
+T.describe("a device capped at 30 FPS keeps its quality", function()
+	local m = Quality.newMonitor(HIGH, HIGH, false)
+	local changes = feed(m, 120, 30)
+	T.eq(table.concat(changes, ","), "3,4", "tries one step down, sees no gain, goes back")
+	T.eq(m.tier, HIGH, "ends on High")
+	-- later the snow gets heavy (many players): much slower than the cap, stepping down helps
+	local heavy = function(tier)
+		return ({ 30, 30, 22, 14 })[tier]
+	end
+	local down = feedBy(m, 20, heavy)
+	T.eq(down[1], MEDIUM, "a new, worse slowdown still lowers the quality")
+	T.eq(m.tier, LOW, "down to where it runs at the cap again")
 end)
 
 T.describe("no flip-flopping", function()

@@ -140,6 +140,48 @@ T.describe("queued history prints", function()
 	T.eq(chunk.pending, nil, "queue consumed")
 end)
 
+T.describe("prints for snow that has not streamed in yet", function()
+	local field = SnowField.new(params)
+	local s = Shapes.new()
+	Shapes.set(s, Shapes.BOX, 10, 10.4, 10, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0.4, 1.4)
+	field:queueStamp(s, 100, 99.5) -- no chunk there yet
+	T.ok(next(field.orphans) ~= nil, "kept aside")
+	field:addRegion(0, 20, 0, 20) -- the snow part arrives
+	T.eq(next(field.orphans), nil, "handed to the new chunks")
+	local chunk = field:getChunk(1, 1) :: SnowField.Chunk
+	field:attachFull(chunk, field:sampleGrid(chunk, 1, flatSampler, noYield), 100)
+	local _, _, cur = field:columnAt(10, 10)
+	T.near(cur, 10.2, 1e-4, "and pressed when it is simulated")
+end)
+
+T.describe("queued prints stay bounded", function()
+	local p2 = table.clone(params)
+	p2.maxPendingPerChunk = 50
+	p2.maxPendingAge = 30
+	local field = SnowField.new(p2)
+	field:addRegion(0, 20, 0, 20)
+	local chunk = field:getChunk(1, 1) :: SnowField.Chunk
+	for k = 1, 500 do
+		local s = Shapes.new()
+		Shapes.set(s, Shapes.BOX, 10, 10.4, 10, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0.4, 1.4)
+		field:queueStamp(s, k, k)
+	end
+	local list = chunk.pending :: { any }
+	T.ok(#list <= 50, `at most maxPendingPerChunk ({#list})`)
+	T.eq(list[#list].hitTime, 500, "the newest are kept")
+	-- (old ones are dropped in batches, and never replayed)
+	field:attachFull(chunk, field:sampleGrid(chunk, 1, flatSampler, noYield), 500)
+	T.eq(chunk.pending, nil, "replayed")
+	-- orphans for chunks that never appear are forgotten once regrown
+	local far = Shapes.new()
+	Shapes.set(far, Shapes.BOX, 500, 10.4, 500, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0.4, 1.4)
+	field:queueStamp(far, 500, 500)
+	field:pruneOrphans(510)
+	T.ok(next(field.orphans) ~= nil, "recent orphans kept")
+	field:pruneOrphans(540)
+	T.eq(next(field.orphans), nil, "old orphans forgotten")
+end)
+
 T.describe("resample keeps prints", function()
 	local field = buildField()
 	local foot = Shapes.new()

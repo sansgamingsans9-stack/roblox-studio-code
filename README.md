@@ -27,9 +27,15 @@ triangle surface (like a mesh), not pixels. (An `EditableMesh` renderer is optio
 - **Multiplayer.** Everyone sees everyone's prints. Players who join later still see the existing
   trails (the server keeps a short history).
 - **Fast.** The world is split into chunks with 4 levels of detail and loaded in the background
-  within a per-frame time budget. Flat untouched snow is merged into big boxes (an untouched
-  25×25-stud chunk is one Part), footprints use as few triangles as their shape needs, and only
-  the Parts that actually change are updated.
+  within a per-frame time budget. Untouched snow is merged into big boxes (an untouched
+  25×25-stud chunk is one Part, and steps between parts at different heights are boxes too),
+  footprints use as few triangles as their shape needs, and only the Parts that actually change
+  are updated.
+- **Runs on phones and low-end PCs.** Each player gets a quality level that fits their device
+  (phone, console, their graphics setting). If the frame rate drops, it lowers the quality by
+  itself, and raises it again when there is room. See [Low-end devices](#low-end-devices-and-loading).
+- **Preloaded.** The snow around the player is built right after joining, before anyone walks.
+  Snow Parts, particles and sounds are prepared ahead of time, so the first steps never stutter.
 
 ## Install (2 minutes)
 
@@ -46,7 +52,7 @@ That's it: one folder, no other setup. It contains:
 | `ClientMain` | Script, **RunContext = Client**. Runs on every player's device. |
 | `ServerMain` | Script, **RunContext = Server**. Shares footprints for late joiners. |
 | `Config` | All the settings, documented. Edit this. |
-| `SnowClient`, `SnowField`, `ChunkParts`, `ChunkMesh`, `Shapes`, `StampCodec`, `SnowServer` | The system. |
+| `SnowClient`, `SnowField`, `ChunkParts`, `ChunkMesh`, `Quality`, `Shapes`, `StampCodec`, `SnowServer` | The system. |
 
 > **Publishing:** nothing to do. The default `Parts` renderer uses only normal Parts, so it works
 > in published games without ID verification or any experience setting.
@@ -69,7 +75,9 @@ files become RunContext scripts).
 | `SnowFolderName` | `"SnowParts"` | Folder in Workspace that holds the snow parts |
 | `Renderer` | `"Parts"` | `"Parts"` or `"EditableMesh"` (see [Renderers](#renderers)) |
 | `PartsSmoothness` | `0.03` | Parts renderer: how closely the triangles follow the snow, in studs (smaller = smoother, more Parts) |
-| `MaxSnowParts` | `12000` | Parts renderer: above this many snow Parts, far snow gets less detail (snow within 16 studs of the camera is never reduced) |
+| `MaxSnowParts` | `12000` | Parts renderer: above this many snow Parts, far snow gets less detail (snow within 16 studs of the camera is never reduced). Lower quality levels use a share of it |
+| `Quality` | `"Auto"` | `"Auto"` picks per device and adapts to the frame rate. Or force `"High"`, `"Medium"`, `"Low"` or `"Potato"` for everyone |
+| `PreloadSeconds` | `6` | After joining, the loader may use more of each frame for this long (it stops early once the nearby snow is built) |
 | `SnowDepth` | `1.0` | Studs of snow on top of each part |
 | `CellSize` | `0.4` | Grid spacing. Smaller means sharper prints but more Parts/memory. `0.25`–`1` |
 | `EdgeFalloff` | `1.5` | EditableMesh renderer: snow thins out over this distance at the edges (Parts: straight edges) |
@@ -86,11 +94,60 @@ files become RunContext scripts).
 | `FootstepParticles` | `true` | Snow puffs |
 | `FootstepSoundId` | `""` | e.g. `"rbxassetid://…"` for a crunch sound |
 | `LodDistances` | `{32, 64, 128}` | Full / half / quarter detail ranges (eighth detail beyond) |
-| `MaxRenderDistance` | `512` | Snow farther away than this isn't drawn |
+| `MaxRenderDistance` | `512` | Snow farther away than this isn't drawn (lower quality levels draw less far) |
 | `SimulationDistance` | `300` | Prints are simulated within this range of the camera |
 | `FrameBudgetMs` | `3` | Background loading time per frame |
 | `SyncFootprints` / `MaxHistory` | `true` / `6000` | Share prints through the server |
 | `Debug` | `false` | Print stats to the Output every 5 s |
+
+## Low-end devices and loading
+
+With `Quality = "Auto"` every player starts at a level that fits their device:
+
+| Device | Starts at |
+| --- | --- |
+| PC / laptop | `High` (or lower if the player turned their graphics quality down: 1–2 `Potato`, 3–4 `Low`, 5–7 `Medium`) |
+| Console | `Medium` |
+| Phone / tablet | `Low` (never climbs above `Medium`) |
+
+While playing, it watches the frame rate:
+- After a few seconds below ~38 FPS it steps down one level.
+- After about 20 smooth seconds above ~55 FPS it steps back up. If that turns out too slow again,
+  it waits longer before the next try.
+- If stepping down did not make the game faster, the snow is not what slows the device down (for
+  example a phone capped at 30 FPS). It goes back up instead of ruining the snow for nothing.
+- A single lag spike never lowers the quality, and neither does a minimized window or the loading
+  right after joining.
+
+| Level | Detail and draw distance | Snow Parts | Triangles | Shadows | Puffs | Footprints pressed |
+| --- | --- | --- | --- | --- | --- | --- |
+| `High` | 100% | 12,000 | finest | yes | all | every frame |
+| `Medium` | 80% | 7,000 | 1.4× coarser | yes | 70% | every frame |
+| `Low` | 60% | 3,500 | 2× coarser | no | 35% | every other frame* |
+| `Potato` | 50% | 1,800 | 3× coarser | no | none | every other frame* |
+
+(Parts numbers are for `MaxSnowParts = 12000`, they scale with it. *Fast objects are also pressed
+at the positions in between, so trails and ruts stay continuous at any frame rate.) On `Low` and
+`Potato`, trails also fill back in slightly bigger steps, other players farther than the last
+detail ring are shown through the server instead of being simulated, and far snow is redrawn at
+most 20 times a second. Phones and `Low`/`Potato`
+devices also use a grid of at least 0.5 studs. Changing quality never makes snow vanish: chunks
+are rebuilt one at a time in the background.
+
+**Loading screens.** `Workspace.DeformableSnowRender` has two attributes:
+
+- `SnowReady` (bool) turns `true` once your character has spawned and the snow around it is
+  drawn. It waits for snow parts that are still streaming in, and never takes longer than
+  `PreloadSeconds` + 10 seconds.
+- `SnowQuality` (string) is the current level.
+
+```lua
+-- e.g. in your loading screen LocalScript: wait for the snow before fading in
+local render = workspace:WaitForChild("DeformableSnowRender")
+if not render:GetAttribute("SnowReady") then
+	render:GetAttributeChangedSignal("SnowReady"):Wait()
+end
+```
 
 ### Per-part control (Properties window)
 
@@ -116,8 +173,9 @@ files become RunContext scripts).
    around the print.
 4. **Drawing.** Each 16×16-stud chunk is drawn by one of two renderers:
    - **Parts** (default): each chunk is split into 16×16-cell tiles.
-     - A tile of level, untouched snow is drawn with boxes, merged as much as possible (a whole
-       untouched chunk is one Part).
+     - A tile of untouched snow is drawn with boxes, merged as much as possible (a whole
+       untouched chunk is one Part). Where parts of different heights meet, the step between them
+       is a clean vertical edge made of boxes (at the two finest detail levels).
      - Any other tile (footprints, trails, rims, slopes) is triangulated with a right-triangulated
        irregular network (RTIN, the "Martini" algorithm): big triangles where the snow is flat,
        small ones only where the shape needs them, never more than `PartsSmoothness` studs off.
@@ -138,6 +196,14 @@ files become RunContext scripts).
 
 ## Good to know
 
+- **StreamingEnabled** works. Snow parts can stream in and out: prints on a part that streams
+  out come back with it, and trails from before you joined appear when their area streams in.
+- **Changing maps**: replace (or remove) the `SnowParts` folder and the snow follows. The old
+  map's snow, colliders and prints go away, and a new `SnowParts` folder gets snow.
+- Invisible character parts (`Transparency` 1, like hitboxes welded to the character) make no
+  prints. A `SnowDeformer`-tagged tool only makes prints while it is in the Workspace (equipped
+  or dropped), not while it sits in a backpack.
+
 - Snow lies on the **topmost** snow surface at each spot, so there's no snow under a snow-covered
   roof. That's also what real snow does.
 - The invisible collider for floating non-collidable parts exists only on players' devices. NPCs
@@ -147,8 +213,10 @@ files become RunContext scripts).
 - MeshPart wheels are treated as boxes. Use Part cylinders for perfect ruts.
 - Parts renderer: triangles are flat-shaded (like a low-poly mesh), and the snow ends in a clean
   vertical edge at the sides of your parts instead of thinning out. A footprint costs about 90
-  WedgeParts at full detail (far fewer farther away); a player walking around keeps roughly
-  4,000–5,000 snow Parts alive. Raise `CellSize` or `PartsSmoothness` for fewer Parts.
+  WedgeParts at full detail (far fewer farther away, and on lower quality levels). Untouched
+  snow costs almost nothing. Raise `CellSize` or `PartsSmoothness` for fewer Parts.
+- When there are more snow Parts than the budget allows, snow farther away gets less detail.
+  Only snow beyond the last detail ring is left out; nearby snow never disappears.
 - Parts renderer: Roblox maps the Snow material per Part with a random offset, so you may see
   faint texture seams between triangles. `Material = Enum.Material.SmoothPlastic` is perfectly
   seamless.
@@ -158,7 +226,7 @@ files become RunContext scripts).
 ## Development
 
 - `tools/test.sh` runs the offline test suite with the [`luau`](https://github.com/luau-lang/luau)
-  CLI: 210 checks across 10 suites.
+  CLI: 416 checks across 16 suites.
   - Unit tests for the geometry, heightfield and network codec.
   - End-to-end runs of the real client and server code against a small Roblox engine mock
     (`tests/rbxmock.luau`), for both renderers. That includes a game where EditableMesh is blocked
@@ -167,6 +235,16 @@ files become RunContext scripts).
     and footprints within the smoothness tolerance with no holes, flat snow as single Parts,
     and no updates for invisible changes. The mock's `EditableMesh` rejects invalid or mixed-up
     ids like the real one.
+  - Quality levels: the starting level per device, the frame-rate watcher (no flip-flopping, no
+    pointless steps on a 30 FPS device), a phone that slows down and recovers with the snow
+    staying correct throughout, continuous ruts at low frame rates, and `SnowReady` timing.
+  - A stress run: several players walking for minutes while snow parts are added, moved and
+    removed, the camera teleports, a character respawns, physics produces NaN positions and the
+    quality changes. Every snow Part must stay accounted for, with no errors, and the snow must
+    regrow into plain boxes.
+  - Big maps (a 1024-stud baseplate: plans only look at the snow near the camera, and a still
+    camera over the Parts budget stops rebuilding), snow parts streaming out and back in, a map
+    swap, tagged tools outside the Workspace and invisible hitboxes.
 
   ```sh
   LUAU=/path/to/luau tools/test.sh
